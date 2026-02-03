@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Handshacke Client</title>
+    <style>
+        body {
+            font-family: 'Courier New', monospace;
+            background: #0a0a0a;
+            color: #00ff00;
+            padding: 20px;
+            max-width: 800px;
+            margin: 0 auto;
+        }
+        .container {
+            background: #111;
+            padding: 20px;
+            border: 1px solid #333;
+            border-radius: 8px;
+        }
+        h1 {
+            text-align: center;
+            color: #00ff00;
+            text-shadow: 0 0 10px #00ff00;
+        }
+        input, button, textarea {
+            background: #222;
+            color: #00ff00;
+            border: 1px solid #333;
+            padding: 10px;
+            margin: 5px 0;
+            width: 100%;
+            border-radius: 4px;
+            font-family: 'Courier New', monospace;
+        }
+        button {
+            cursor: pointer;
+            background: #333;
+        }
+        button:hover {
+            background: #444;
+            box-shadow: 0 0 5px #00ff00;
+        }
+        .status {
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 4px;
+            border: 1px solid #333;
+        }
+        .connected { border-color: #00ff00; background: #001100; }
+        .error { border-color: #ff0000; background: #110000; color: #ff0000; }
+        .warning { border-color: #ffff00; background: #111100; color: #ffff00; }
+        #messages {
+            background: #000;
+            height: 300px;
+            overflow-y: auto;
+            padding: 10px;
+            border: 1px solid #333;
+            font-size: 12px;
+        }
+        .message {
+            margin: 5px 0;
+            padding: 5px;
+            border-left: 3px solid #00ff00;
+            background: #001100;
+        }
+        .message.received {
+            border-left-color: #0088ff;
+            background: #000011;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🤝 HANDSHACKE CLIENT</h1>
+        
+        <div>
+            <input type="password" id="passphrase" placeholder="Enter passphrase..." />
+            <button onclick="connect()">🔐 CONNECT</button>
+            <button onclick="disconnect()">❌ DISCONNECT</button>
+        </div>
+        
+        <div id="status" class="status">Status: Disconnected</div>
+        
+        <div>
+            <input type="text" id="messageInput" placeholder="Type your message..." />
+            <button onclick="sendMessage()">📤 SEND</button>
+        </div>
+        
+        <h3>📺 MESSAGES</h3>
+        <div id="messages"></div>
+    </div>
+
+    <script>
+        let eventSource = null;
+        let isConnected = false;
+        
+        async function connect() {
+            const passphrase = document.getElementById('passphrase').value;
+            if (!passphrase) {
+                alert('Please enter a passphrase');
+                return;
+            }
+            
+            updateStatus('Connecting...', 'warning');
+            
+            try {
+                // Set passphrase
+                await fetch('/v1/set_passphrase', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ passphrase })
+                });
+                
+                // Connect
+                const res = await fetch('/v1/connect', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ passphrase })
+                });
+                
+                if (res.ok) {
+                    const data = await res.json();
+                    updateStatus(`Connected (${data.mode}) on port ${data.port}`, 'connected');
+                    isConnected = true;
+                    
+                    // Start listening for messages
+                    eventSource = new EventSource('/v1/recv');
+                    eventSource.onmessage = handleMessage;
+                    eventSource.onerror = handleSSEError;
+                } else {
+                    throw new Error(`Connection failed: ${res.status}`);
+                }
+            } catch (error) {
+                updateStatus(`Error: ${error.message}`, 'error');
+            }
+        }
+        
+        async function disconnect() {
+            try {
+                await fetch('/v1/disconnect', { method: 'POST' });
+                if (eventSource) {
+                    eventSource.close();
+                    eventSource = null;
+                }
+                isConnected = false;
+                updateStatus('Disconnected', '');
+                addMessage('System', 'Disconnected', 'system');
+            } catch (error) {
+                console.error('Disconnect error:', error);
+            }
+        }
+        
+        async function sendMessage() {
+            if (!isConnected) {
+                alert('Not connected');
+                return;
+            }
+            
+            const input = document.getElementById('messageInput');
+            const message = input.value.trim();
+            if (!message) return;
+            
+            try {
+                // Seal the message
+                const sealRes = await fetch('/v1/seal', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ data_b64: btoa(message) })
+                });
+                
+                if (!sealRes.ok) throw new Error('Failed to seal message');
+                const sealed = await sealRes.json();
+                
+                // Send the sealed packet
+                const sendRes = await fetch('/v1/send', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ packet_b64: sealed.packet_b64 })
+                });
+                
+                if (sendRes.ok) {
+                    addMessage('You', message, 'sent');
+                    input.value = '';
+                } else {
+                    throw new Error('Failed to send message');
+                }
+            } catch (error) {
+                addMessage('Error', error.message, 'error');
+            }
+        }
+        
+        async function handleMessage(event) {
+            try {
+                const packet_b64 = event.data;
+                
+                // Try to open the packet
+                const openRes = await fetch('/v1/open', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ packet_b64 })
+                });
+                
+                if (openRes.ok) {
+                    const opened = await openRes.json();
+                    const message = atob(opened.data_b64);
+                    addMessage('Peer', message, 'received');
+                } else {
+                    console.log('Received undecryptable packet');
+                }
+            } catch (error) {
+                console.error('Message handling error:', error);
+            }
+        }
+        
+        function handleSSEError(error) {
+            console.error('SSE Error:', error);
+            updateStatus('Connection lost', 'error');
+        }
+        
+        function updateStatus(text, className) {
+            const status = document.getElementById('status');
+            status.textContent = `Status: ${text}`;
+            status.className = `status ${className}`;
+        }
+        
+        function addMessage(sender, content, type) {
+            const messages = document.getElementById('messages');
+            const msgDiv = document.createElement('div');
+            msgDiv.className = `message ${type}`;
+            // peer data = untrusted
+            const header = document.createElement('strong');
+            header.textContent = `[${new Date().toLocaleTimeString()}] ${sender}:`;
+            msgDiv.appendChild(header);
+            msgDiv.appendChild(document.createTextNode(` ${content}`));
+            messages.appendChild(msgDiv);
+            messages.scrollTop = messages.scrollHeight;
+        }
+        
+        // Handle Enter key in message input
+        document.getElementById('messageInput').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                sendMessage();
+            }
+        });
+        
+        // Handle Enter key in passphrase input
+        document.getElementById('passphrase').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                connect();
+            }
+        });
+        
+        // Add some initial messages
+        addMessage('System', 'Handshacke client loaded. Enter passphrase and connect.', 'system');
+    </script>
+</body>
+</html>

@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  fmt_clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Format
+        run: cargo fmt -- --check
+      - name: Clippy
+        run: cargo clippy -- -D warnings
+
+  tests:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        cmd:
+          - name: default
+            run: cargo test
+          - name: no-default-features
+            run: cargo test --no-default-features
+          - name: pq-only
+            run: cargo test --no-default-features --features pq
+          - name: quic-only
+            run: cargo test --no-default-features --features quic
+          - name: webrtc-only
+            run: cargo test --no-default-features --features webrtc
+    name: tests (${{ matrix.os }} / ${{ matrix.cmd.name }})
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test
+        run: ${{ matrix.cmd.run }}

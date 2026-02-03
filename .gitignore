@@ -1,0 +1,46 @@
+# Rust build artifacts
+target/
+# Keep Cargo.lock for applications (as per Cargo best practices)
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Backup files (manual backups)
+*.backup
+*.bak
+*.orig
+*.rej
+
+# Environment and secrets
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.jks
+*.keystore
+config.local.*
+
+# Logs and temp files
+*.log
+*.tmp
+*.temp
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local API token file
+.handshacke_api_token
+
+# Build artifacts (if any)
+*.o
+*.so
+*.exe
+*.out

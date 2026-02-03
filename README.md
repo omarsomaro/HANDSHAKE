@@ -80,14 +80,16 @@ cd ui
 npm install
 npm run dev
 ```
+With the actual configuration you need 2 terminals open, because tauri.conf.json has beforeDevCommand empty
+1. Terminale 1:
 
-For a packaged desktop build:
-```
-cd ui
-npm run build
-```
+  cd ui
+  npx vite
 
-See docs/gui_flows.md for the exact user flows supported by the GUI.
+  2. Terminale 2:
+
+  cd ui
+  npm run dev
 
 ### 3) Web Client (legacy/debug)
 

@@ -131,7 +131,7 @@ async fn configure_tor_bridge(socks_addr: &str, bridge: &TorBridge) -> Result<()
 ///
 /// Tor daemon must have a HiddenService configured to forward to this address.
 /// Example torrc:
-/// ```
+/// ```text
 /// HiddenServiceDir /var/lib/tor/handshake/
 /// HiddenServicePort 9999 127.0.0.1:9999
 /// ```

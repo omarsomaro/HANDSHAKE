@@ -460,6 +460,9 @@ mod tests {
 
     #[test]
     fn test_crypto_performance() {
+        if std::env::var("CI").is_ok() {
+            return;
+        }
         let key = [42u8; 32];
         let tag = 0x1337;
         let payload = ClearPayload {

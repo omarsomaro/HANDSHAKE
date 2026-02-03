@@ -238,9 +238,7 @@ pub async fn connect_to(
     let timeout_ms = cfg.wan_connect_timeout_ms.clamp(1, 10000); // Cap timeout to prevent resource exhaustion
 
     match timeout(Duration::from_millis(timeout_ms), sock.recv_from(&mut buf)).await {
-        Ok(Ok((n, from)))
-            if from == peer && (8..=UDP_MAX_PACKET_SIZE).contains(&n) =>
-        {
+        Ok(Ok((n, from))) if from == peer && (8..=UDP_MAX_PACKET_SIZE).contains(&n) => {
             // Additional validation: ensure response is reasonable size
             if !early_drop_packet(&buf[..n], params.tag16, params.tag8) {
                 tracing::debug!(

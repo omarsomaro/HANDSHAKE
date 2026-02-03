@@ -174,10 +174,7 @@ impl IceAgent {
                 u16::from_be_bytes([response[offset + 2], response[offset + 3]]) as usize;
             let padded_len = attr_len.div_ceil(4) * 4;
 
-            if attr_type == 0x0020
-                && offset + 4 + attr_len <= response.len()
-                && attr_len >= 8
-            {
+            if attr_type == 0x0020 && offset + 4 + attr_len <= response.len() && attr_len >= 8 {
                 let family = response[offset + 5];
                 if family == 0x01 {
                     let port = u16::from_be_bytes([response[offset + 6], response[offset + 7]]);

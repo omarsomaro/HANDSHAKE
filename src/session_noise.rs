@@ -133,8 +133,7 @@ impl ProtocolState {
         use crate::protocol::Control;
         matches!(
             (self, message_type),
-            (ProtocolState::Handshake, Control::NoiseHandshake(_))
-                | (ProtocolState::Transport, _)
+            (ProtocolState::Handshake, Control::NoiseHandshake(_)) | (ProtocolState::Transport, _)
         )
     }
 
@@ -143,8 +142,7 @@ impl ProtocolState {
         use crate::protocol::Control;
         matches!(
             (self, message_type),
-            (ProtocolState::Handshake, Control::NoiseHandshake(_))
-                | (ProtocolState::Transport, _)
+            (ProtocolState::Handshake, Control::NoiseHandshake(_)) | (ProtocolState::Transport, _)
         )
     }
 }

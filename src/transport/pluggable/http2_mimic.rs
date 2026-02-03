@@ -166,24 +166,6 @@ impl ProtocolMimicry for Http2Mimic {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_connection_preface() {
-        let preface = Http2Mimic::build_connection_preface();
-        assert_eq!(preface, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
-    }
-
-    #[test]
-    fn test_data_frame() {
-        let frame = Http2Mimic::build_data_frame(1, b"test", true);
-        assert_eq!(frame.len(), 9 + 4); // header 9 + data 4
-        assert_eq!(&frame[9..13], b"test");
-    }
-}
-
 #[allow(dead_code)]
 fn encode_hpack_header(name: &str, value: &str) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -289,7 +271,7 @@ fn parse_hpack_header(data: &mut &[u8]) -> Result<(String, String)> {
         *data = &data[1..];
 
         // Read name length and value
-        if data.len() < 1 {
+        if data.is_empty() {
             bail!("Invalid HPACK: no name length");
         }
         let name_len = data[0] as usize;
@@ -302,7 +284,7 @@ fn parse_hpack_header(data: &mut &[u8]) -> Result<(String, String)> {
         *data = &data[name_len..];
 
         // Read value length and value
-        if data.len() < 1 {
+        if data.is_empty() {
             bail!("Invalid HPACK: no value length");
         }
         let value_len = data[0] as usize;
@@ -318,4 +300,22 @@ fn parse_hpack_header(data: &mut &[u8]) -> Result<(String, String)> {
     }
 
     bail!("Unsupported HPACK encoding: {:02x}", data[0])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_connection_preface() {
+        let preface = Http2Mimic::build_connection_preface();
+        assert_eq!(preface, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    }
+
+    #[test]
+    fn test_data_frame() {
+        let frame = Http2Mimic::build_data_frame(1, b"test", true);
+        assert_eq!(frame.len(), 9 + 4); // header 9 + data 4
+        assert_eq!(&frame[9..13], b"test");
+    }
 }

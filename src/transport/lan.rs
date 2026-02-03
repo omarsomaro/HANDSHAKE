@@ -63,7 +63,7 @@ pub async fn listen_for_discovery(
 
     loop {
         tokio::select! {
-            _ = tokio::time::sleep_until(deadline.into()) => {
+            _ = tokio::time::sleep_until(deadline) => {
                 return Err(anyhow::anyhow!("LAN discovery timeout"));
             }
             res = sock.recv_from(&mut buf) => {
@@ -73,7 +73,7 @@ pub async fn listen_for_discovery(
             && &buf[..ACK_PREFIX.len()] == ACK_PREFIX
         {
             let ack_nonce = &buf[ACK_PREFIX.len()..ACK_PREFIX.len() + NONCE_LEN];
-            if ack_nonce == &own_nonce {
+            if ack_nonce == own_nonce {
                 tracing::debug!("Discovery ACK received from {}", addr);
                 return Ok(addr);
             }
@@ -83,7 +83,7 @@ pub async fn listen_for_discovery(
             && &buf[..DISCOVERY_PREFIX.len()] == DISCOVERY_PREFIX
         {
             let their_nonce = &buf[DISCOVERY_PREFIX.len()..DISCOVERY_PREFIX.len() + NONCE_LEN];
-            if their_nonce != &own_nonce {
+            if their_nonce != own_nonce {
                 let mut ack = Vec::with_capacity(ACK_PREFIX.len() + NONCE_LEN);
                 ack.extend_from_slice(ACK_PREFIX);
                 ack.extend_from_slice(their_nonce);

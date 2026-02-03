@@ -39,6 +39,11 @@ use tokio::time::{sleep, timeout, Duration};
 
 use wan::WanConnection;
 
+type TorStreamSplit = (
+    Arc<TokioMutex<OwnedReadHalf>>,
+    Arc<TokioMutex<OwnedWriteHalf>>,
+);
+
 /// Connection type established by transport layer
 #[derive(Clone)]
 pub enum Connection {
@@ -84,12 +89,7 @@ impl Connection {
     }
 
     /// Get Tor stream (only for Tor connections)
-    pub fn get_tor_stream(
-        &self,
-    ) -> Option<(
-        Arc<TokioMutex<OwnedReadHalf>>,
-        Arc<TokioMutex<OwnedWriteHalf>>,
-    )> {
+    pub fn get_tor_stream(&self) -> Option<TorStreamSplit> {
         match self {
             Connection::WanTorStream { reader, writer } => Some((reader.clone(), writer.clone())),
             _ => None,
@@ -142,7 +142,7 @@ pub async fn establish_connection(p: &RendezvousParams, cfg: &Config) -> Result<
             attempts += 1;
             match timeout(
                 Duration::from_secs(2),
-                wan_assist::try_assisted_punch(p, &[relay.clone()], cfg),
+                wan_assist::try_assisted_punch(p, std::slice::from_ref(relay), cfg),
             )
             .await
             {
@@ -223,7 +223,7 @@ pub async fn connect_to(
     sock.connect(peer).await?;
 
     let probe = build_probe_packet(params.tag16);
-    let burst = cfg.wan_probe_burst.max(1).min(10); // Limit max burst to prevent amplification
+    let burst = cfg.wan_probe_burst.clamp(1, 10); // Limit max burst to prevent amplification
 
     // Rate limiting: max 1 probe per 100ms per target to prevent amplification attacks
     let probe_interval = cfg.wan_probe_interval_ms.max(100);
@@ -235,10 +235,12 @@ pub async fn connect_to(
     }
 
     let mut buf = vec![0u8; 1024];
-    let timeout_ms = cfg.wan_connect_timeout_ms.max(1).min(10000); // Cap timeout to prevent resource exhaustion
+    let timeout_ms = cfg.wan_connect_timeout_ms.clamp(1, 10000); // Cap timeout to prevent resource exhaustion
 
     match timeout(Duration::from_millis(timeout_ms), sock.recv_from(&mut buf)).await {
-        Ok(Ok((n, from))) if from == peer && n >= 8 && n <= UDP_MAX_PACKET_SIZE => {
+        Ok(Ok((n, from)))
+            if from == peer && (8..=UDP_MAX_PACKET_SIZE).contains(&n) =>
+        {
             // Additional validation: ensure response is reasonable size
             if !early_drop_packet(&buf[..n], params.tag16, params.tag8) {
                 tracing::debug!(

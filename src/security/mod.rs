@@ -106,8 +106,8 @@ pub fn early_drop_packet(packet: &[u8], expected_tag16: u16, expected_tag8: u8) 
         return true;
     }
     let version = packet[3];
-    if version < crate::crypto::MIN_SUPPORTED_VERSION
-        || version > crate::crypto::MAX_SUPPORTED_VERSION
+    if !(crate::crypto::MIN_SUPPORTED_VERSION..=crate::crypto::MAX_SUPPORTED_VERSION)
+        .contains(&version)
     {
         return true;
     }

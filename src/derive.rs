@@ -82,7 +82,7 @@ fn derive_from_passphrase_v2_with_salt(
         derive_argon2_salt_v2(&pass_bytes)
     };
 
-    let salt_b64 = general_purpose::STANDARD_NO_PAD.encode(&salt_bytes);
+    let salt_b64 = general_purpose::STANDARD_NO_PAD.encode(salt_bytes);
     let salt = Salt::from_b64(&salt_b64).expect("valid base64 salt");
 
     // 2. Argon2id con parametri bilanciati
@@ -259,7 +259,7 @@ mod tests {
         for i in 0..100 {
             let params = derive_from_passphrase(&format!("test{}", i));
             assert!(params.port >= MIN_EPHEMERAL_PORT);
-            assert!(params.port <= MAX_PORT);
+            assert!(params.port < MAX_PORT);
         }
     }
 }

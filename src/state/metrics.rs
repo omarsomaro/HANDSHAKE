@@ -213,6 +213,12 @@ impl MetricsCollector {
     }
 }
 
+impl Default for MetricsCollector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Utility per timing crypto operations
 pub struct CryptoTimer {
     start: Instant,

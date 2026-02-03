@@ -139,7 +139,7 @@ async fn wait_for_hostname(path: &Path, timeout: Duration) -> Result<String> {
 fn ensure_port_available(port: u16) -> Result<()> {
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
     TcpListener::bind(addr)
-        .map(|listener| drop(listener))
+        .map(drop)
         .map_err(|e| anyhow!("Port {} is not available: {}", port, e))
 }
 

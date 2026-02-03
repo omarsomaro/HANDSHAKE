@@ -65,7 +65,7 @@ impl WebSocketMimic {
     /// Generate Sec-WebSocket-Key
     fn generate_key() -> String {
         let key_bytes = util::random_bytes(16);
-        STANDARD.encode(&key_bytes)
+        STANDARD.encode(key_bytes)
     }
 
     /// Calculate Sec-WebSocket-Accept from key
@@ -75,7 +75,7 @@ impl WebSocketMimic {
         hasher.update(key.as_bytes());
         hasher.update(magic.as_bytes());
         let result = hasher.finalize();
-        STANDARD.encode(&result)
+        STANDARD.encode(result)
     }
 
     /// Parse HTTP response headers

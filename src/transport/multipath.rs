@@ -10,18 +10,13 @@ use tokio::sync::Mutex;
 use crate::transport::Connection;
 
 /// Multipath connection scheduler policy
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum SchedulerPolicy {
     /// Send identical data on all paths, receive from first
+    #[default]
     Redundant,
     /// Split data 70/30 for bandwidth aggregation
     Split,
-}
-
-impl Default for SchedulerPolicy {
-    fn default() -> Self {
-        Self::Redundant
-    }
 }
 
 /// Path routing policy for data distribution
@@ -145,7 +140,7 @@ impl MultipathConnection {
         handle
             .update_metadata(|meta| {
                 meta.rtt_ms = rtt_ms;
-                meta.loss_rate = loss_rate.min(1.0).max(0.0);
+                meta.loss_rate = loss_rate.clamp(0.0, 1.0);
             })
             .await;
 

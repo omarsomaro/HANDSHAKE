@@ -48,10 +48,12 @@ pub enum TransportKind {
     Tor,
 }
 
-/// Cache globale del tipo di NAT (5 minuti) - Lazy initialization
-static NAT_CACHE: OnceLock<Arc<Mutex<Option<(NatType, Instant)>>>> = OnceLock::new();
+type NatCache = Arc<Mutex<Option<(NatType, Instant)>>>;
 
-fn get_nat_cache() -> Arc<Mutex<Option<(NatType, Instant)>>> {
+/// Cache globale del tipo di NAT (5 minuti) - Lazy initialization
+static NAT_CACHE: OnceLock<NatCache> = OnceLock::new();
+
+fn get_nat_cache() -> NatCache {
     NAT_CACHE.get_or_init(|| Arc::new(Mutex::new(None))).clone()
 }
 
@@ -260,7 +262,7 @@ impl NatDetector {
             let attr_type = u16::from_be_bytes([response[offset], response[offset + 1]]);
             let attr_len =
                 u16::from_be_bytes([response[offset + 2], response[offset + 3]]) as usize;
-            let padded_len = ((attr_len + 3) / 4) * 4;
+            let padded_len = attr_len.div_ceil(4) * 4;
 
             if attr_type == 0x0020 || attr_type == 0x0001 {
                 // XOR-MAPPED-ADDRESS or MAPPED-ADDRESS

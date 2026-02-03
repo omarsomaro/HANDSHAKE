@@ -131,21 +131,21 @@ impl ProtocolState {
     /// Check if current state allows message transmission
     pub fn can_send_message(&self, message_type: &crate::protocol::Control) -> bool {
         use crate::protocol::Control;
-        match (self, message_type) {
-            (ProtocolState::Handshake, Control::NoiseHandshake(_)) => true,
-            (ProtocolState::Transport, _) => true,
-            _ => false,
-        }
+        matches!(
+            (self, message_type),
+            (ProtocolState::Handshake, Control::NoiseHandshake(_))
+                | (ProtocolState::Transport, _)
+        )
     }
 
     /// Check if current state allows message reception
     pub fn can_receive_message(&self, message_type: &crate::protocol::Control) -> bool {
         use crate::protocol::Control;
-        match (self, message_type) {
-            (ProtocolState::Handshake, Control::NoiseHandshake(_)) => true,
-            (ProtocolState::Transport, _) => true,
-            _ => false,
-        }
+        matches!(
+            (self, message_type),
+            (ProtocolState::Handshake, Control::NoiseHandshake(_))
+                | (ProtocolState::Transport, _)
+        )
     }
 }
 
@@ -205,12 +205,12 @@ fn select_noise_params(conn: &Connection) -> Result<snow::params::NoiseParams> {
         #[cfg(feature = "pq")]
         {
             tracing::info!("Noise PQ enabled for stream connection");
-            return pq_noise_params();
+            pq_noise_params()
         }
         #[cfg(not(feature = "pq"))]
         {
             tracing::info!("Noise PQ feature disabled; using classic XX");
-            return classic_noise_params();
+            classic_noise_params()
         }
     } else {
         tracing::info!("Noise PQ disabled for UDP; using classic XX to fit MTU");
@@ -273,6 +273,7 @@ pub async fn run_noise_upgrade(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_noise_upgrade_io<FSend, FRecv, FS, FR>(
     role: NoiseRole,
     send: FSend,

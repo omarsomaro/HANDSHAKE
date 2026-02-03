@@ -197,7 +197,7 @@ pub fn stealth_mode_from_env() -> StealthMode {
     match std::env::var("HANDSHACKE_STEALTH_MODE").as_deref() {
         Ok("passive") => StealthMode::Passive,
         Ok("mdns") => StealthMode::Mdns,
-        Ok("active") | _ => StealthMode::Active,
+        _ => StealthMode::Active,
     }
 }
 

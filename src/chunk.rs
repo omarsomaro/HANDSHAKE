@@ -19,7 +19,7 @@ pub struct Chunk {
 
 /// Divide dati in chunks di dimensione massima
 pub fn split_chunks(id: u64, data: &[u8], max_chunk: usize) -> Vec<(ChunkHeader, Vec<u8>)> {
-    let total = ((data.len() + max_chunk - 1) / max_chunk) as u16;
+    let total = data.len().div_ceil(max_chunk) as u16;
     let mut v = Vec::with_capacity(total as usize);
 
     for (i, chunk) in data.chunks(max_chunk).enumerate() {
@@ -77,6 +77,12 @@ impl Reassembler {
     pub fn clear(&mut self) {
         self.buf.clear();
         self.total = None;
+    }
+}
+
+impl Default for Reassembler {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

@@ -302,6 +302,12 @@ impl ConnectionManager {
     }
 }
 
+impl Default for ConnectionManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Drop for ConnectionManager {
     fn drop(&mut self) {
         self.stop_auto_reconnect();

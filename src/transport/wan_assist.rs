@@ -257,7 +257,7 @@ async fn udp_burst_punch(
 
     // Timer per coordinazione
     let start = tokio::time::Instant::now();
-    let go_after = go.go_after_ms.max(10).min(3000); // Guardrail 10ms-3s
+    let go_after = go.go_after_ms.clamp(10, 3000); // Guardrail 10ms-3s
     let go_at = start + Duration::from_millis(go_after as u64);
 
     // Burst + listen simultanei
@@ -315,7 +315,7 @@ async fn udp_burst_punch(
             tracing::info!("WAN Assist: received probe from {}", peer_addr);
             Ok(crate::transport::Connection::Wan(sock, peer_addr))
         }
-        Ok(Err(e)) => Err(e.into()),
+        Ok(Err(e)) => Err(e),
         Err(_) => bail!("WAN Assist: no response from peer"),
     }
 }

@@ -185,6 +185,9 @@ impl crate::transport::pluggable::TransportChannel for RealTlsChannel {
     }
 }
 
+// Re-export for integration
+pub use RealTlsChannel as TlsChannel;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,6 +222,3 @@ mod tests {
         }
     }
 }
-
-// Re-export for integration
-pub use RealTlsChannel as TlsChannel;

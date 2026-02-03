@@ -259,7 +259,7 @@ fn ipv4_from_mapped_ipv6(bytes: &[u8]) -> Result<Ipv4Addr> {
         anyhow::bail!("not 16 bytes");
     }
     // Check it's IPv4-mapped: ::ffff:xxxx:xxxx
-    if &bytes[0..10] != &[0u8; 10] || &bytes[10..12] != [0xFF, 0xFF] {
+    if bytes[0..10] != [0u8; 10] || bytes[10..12] != [0xFF, 0xFF] {
         anyhow::bail!("not IPv4-mapped IPv6");
     }
     Ok(Ipv4Addr::new(bytes[12], bytes[13], bytes[14], bytes[15]))

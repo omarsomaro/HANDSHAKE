@@ -418,13 +418,11 @@ async fn handle_connect(
     let product_mode = req.product_mode;
 
     // Validate A/B request semantics
-    if product_mode == ProductMode::Guaranteed {
-        if req.target_onion.is_some() {
-            return Err(connect_err(
-                StatusCode::BAD_REQUEST,
-                "target_onion not allowed in guaranteed mode",
-            ));
-        }
+    if product_mode == ProductMode::Guaranteed && req.target_onion.is_some() {
+        return Err(connect_err(
+            StatusCode::BAD_REQUEST,
+            "target_onion not allowed in guaranteed mode",
+        ));
     }
 
     // Validate Tor config (Classic only)
@@ -620,7 +618,7 @@ async fn handle_connect(
             return Err(connect_err(StatusCode::BAD_REQUEST, "invalid request"));
         }
 
-        let local_role = req.local_role.unwrap_or_else(|| match offer.role_hint {
+        let local_role = req.local_role.unwrap_or(match offer.role_hint {
             RoleHint::Host => RoleHint::Client,
             RoleHint::Client => RoleHint::Host,
         });

@@ -50,11 +50,7 @@ impl TimeValidator {
         let actual_system_ms = now_system.duration_since(UNIX_EPOCH)?.as_millis() as u64;
         let expected_system_ms = expected_system.duration_since(UNIX_EPOCH)?.as_millis() as u64;
 
-        let time_diff = if actual_system_ms > expected_system_ms {
-            actual_system_ms - expected_system_ms
-        } else {
-            expected_system_ms - actual_system_ms
-        };
+        let time_diff = actual_system_ms.abs_diff(expected_system_ms);
 
         // If clock jump is too large, use monotonic-based time
         if time_diff > MAX_CLOCK_SKEW_MS {
@@ -92,7 +88,7 @@ impl TimeValidator {
         }
 
         // Additional check: offer shouldn't be too old even if TTL allows
-        const MAX_AGE_MS: u64 = 3600_000; // 1 hour maximum
+        const MAX_AGE_MS: u64 = 3_600_000; // 1 hour maximum
         if age_ms > MAX_AGE_MS {
             anyhow::bail!("Offer too old: {}ms > {}ms max age", age_ms, MAX_AGE_MS);
         }
@@ -105,11 +101,7 @@ impl TimeValidator {
         let now_ms = self.now_monotonic_validated()?;
 
         // Check if timestamp is within acceptable window
-        let time_diff = if timestamp_ms > now_ms {
-            timestamp_ms - now_ms
-        } else {
-            now_ms - timestamp_ms
-        };
+        let time_diff = timestamp_ms.abs_diff(now_ms);
 
         if time_diff > window_ms {
             anyhow::bail!(
@@ -139,11 +131,7 @@ impl TimeValidator {
             Err(_) => return 0.0,
         };
 
-        let time_diff = if actual_system_ms > expected_system_ms {
-            actual_system_ms - expected_system_ms
-        } else {
-            expected_system_ms - actual_system_ms
-        };
+        let time_diff = actual_system_ms.abs_diff(expected_system_ms);
 
         // Confidence decreases with larger time differences
         if time_diff <= 1000 {
@@ -184,7 +172,7 @@ mod tests {
         assert!(validator.validate_offer_time(future, 60).is_err());
 
         // Very old timestamp should fail
-        let old = now - 7200_000; // 2 hours ago
+        let old = now - 7_200_000; // 2 hours ago
         assert!(validator.validate_offer_time(old, 60).is_err());
     }
 

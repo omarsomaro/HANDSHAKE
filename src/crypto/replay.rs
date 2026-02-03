@@ -21,6 +21,7 @@ impl ReplayWindow {
     /// Controlla e accetta una sequenza se non è replay
     /// SECURITY: Constant-time per evitare timing attacks
     /// Returns Ok(true) if accepted, Ok(false) if replay, Err(()) if overflow detected
+    #[allow(clippy::result_unit_err)]
     pub fn accept(&mut self, seq: u64) -> Result<bool, ()> {
         // Check for overflow condition: max_seen is near u64::MAX and new sequence is small
         if self.max_seen >= u64::MAX - OVERFLOW_THRESHOLD && seq < OVERFLOW_THRESHOLD {
@@ -77,6 +78,12 @@ impl ReplayWindow {
     /// Maintains backward compatibility by returning bool instead of Result
     pub fn check(&mut self, seq: u64) -> bool {
         self.accept(seq).unwrap_or(false)
+    }
+}
+
+impl Default for ReplayWindow {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

@@ -89,7 +89,7 @@ pub mod util {
         let mut crc = 0u32;
         for &byte in data {
             crc = crc.wrapping_add(byte as u32);
-            crc = (crc << 1) | (crc >> 31); // Rotate
+            crc = crc.rotate_left(1);
         }
         crc
     }

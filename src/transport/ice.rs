@@ -19,6 +19,8 @@ use crate::transport::{
     Connection,
 };
 
+type IceAttemptFuture = BoxFuture<'static, Result<Option<(Connection, SocketAddr)>>>;
+
 #[derive(Debug, Clone)]
 pub struct IceCandidate {
     pub kind: IceCandidateKind,
@@ -156,7 +158,7 @@ impl IceAgent {
 
         let response = &buf[..n];
 
-        if response.len() < 20 || &response[0..2] != &[0x01, 0x01] {
+        if response.len() < 20 || response[0..2] != [0x01, 0x01] {
             return Ok(None);
         }
 
@@ -170,21 +172,22 @@ impl IceAgent {
             let attr_type = u16::from_be_bytes([response[offset], response[offset + 1]]);
             let attr_len =
                 u16::from_be_bytes([response[offset + 2], response[offset + 3]]) as usize;
-            let padded_len = ((attr_len + 3) / 4) * 4;
+            let padded_len = attr_len.div_ceil(4) * 4;
 
-            if attr_type == 0x0020 {
-                if offset + 4 + attr_len <= response.len() && attr_len >= 8 {
-                    let family = response[offset + 5];
-                    if family == 0x01 {
-                        let port = u16::from_be_bytes([response[offset + 6], response[offset + 7]]);
-                        let ip = Ipv4Addr::new(
-                            response[offset + 8],
-                            response[offset + 9],
-                            response[offset + 10],
-                            response[offset + 11],
-                        );
-                        return Ok(Some(SocketAddr::new(ip.into(), port)));
-                    }
+            if attr_type == 0x0020
+                && offset + 4 + attr_len <= response.len()
+                && attr_len >= 8
+            {
+                let family = response[offset + 5];
+                if family == 0x01 {
+                    let port = u16::from_be_bytes([response[offset + 6], response[offset + 7]]);
+                    let ip = Ipv4Addr::new(
+                        response[offset + 8],
+                        response[offset + 9],
+                        response[offset + 10],
+                        response[offset + 11],
+                    );
+                    return Ok(Some(SocketAddr::new(ip.into(), port)));
                 }
             }
 
@@ -223,7 +226,7 @@ impl IceAgent {
     }
 
     async fn gather_tor_candidates(&self) -> Result<Vec<IceCandidate>> {
-        if self.config.tor_onion_addr.is_none() && !self.offer.tor_onion_addr()?.is_some() {
+        if self.config.tor_onion_addr.is_none() && self.offer.tor_onion_addr()?.is_none() {
             return Ok(vec![]);
         }
 
@@ -268,9 +271,7 @@ impl IceAgent {
             eligible.push(candidate);
         }
 
-        let futures: FuturesUnordered<
-            BoxFuture<'static, Result<Option<(Connection, SocketAddr)>>>,
-        > = FuturesUnordered::new();
+        let futures: FuturesUnordered<IceAttemptFuture> = FuturesUnordered::new();
 
         for candidate in eligible {
             let agent = self.clone();
@@ -340,7 +341,7 @@ impl IceAgent {
 
     async fn wait_first_success(
         &self,
-        mut futures: FuturesUnordered<BoxFuture<'static, Result<Option<(Connection, SocketAddr)>>>>,
+        mut futures: FuturesUnordered<IceAttemptFuture>,
     ) -> Result<(Connection, SocketAddr)> {
         while let Some(res) = futures.next().await {
             match res {
@@ -459,7 +460,7 @@ impl IceAgent {
                 Duration::from_secs(2),
                 transport::wan_assist::try_assisted_punch(
                     &self.params,
-                    &[relay.clone()],
+                    std::slice::from_ref(relay),
                     &self.config,
                 ),
             )

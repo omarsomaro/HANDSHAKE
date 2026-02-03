@@ -153,7 +153,7 @@ mod tests {
         let result = TcpHolePunch::test_port_open("127.0.0.1:1".parse().unwrap()).await;
 
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), false); // Port 1 is likely closed
+        assert!(!result.unwrap()); // Port 1 is likely closed
 
         // Test on localhost - port 22 (ssh) might be open
         let result = TcpHolePunch::test_port_open("127.0.0.1:22".parse().unwrap()).await;

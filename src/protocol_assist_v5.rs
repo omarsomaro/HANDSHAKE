@@ -21,14 +21,8 @@ use subtle::ConstantTimeEq;
 pub const ASSIST_V5_CANDIDATES: usize = 8;
 
 /// 24-byte fixed layout (before obfuscation)
-#[derive(Debug, Copy, Clone, Serialize, Deserialize, Zeroize)]
+#[derive(Debug, Copy, Clone, Serialize, Deserialize, Zeroize, Default)]
 pub struct BlindedCandidate(pub [u8; 24]);
-
-impl Default for BlindedCandidate {
-    fn default() -> Self {
-        Self([0u8; 24])
-    }
-}
 
 #[derive(Serialize, Deserialize, Debug, Clone, Zeroize, ZeroizeOnDrop)]
 pub struct AssistRequestV5 {
@@ -323,8 +317,7 @@ pub fn make_blinded_candidates_v5_shuffled(
     }
 
     // Fill remaining positions with dummies
-    for i in take_n..ASSIST_V5_CANDIDATES {
-        let pos = positions[i];
+    for &pos in positions.iter().skip(take_n) {
         let dummy = generate_dummy_candidate(pos);
         let nonce = derive_entry_nonce_v5_improved(request_id, pos, obf_key);
         out[pos] = BlindedCandidate::blind(&dummy, obf_key, &nonce);
@@ -358,11 +351,11 @@ pub fn make_blinded_candidates_v5_anti_cluster(
     }
 
     // Fill gaps with dummies
-    for i in 0..ASSIST_V5_CANDIDATES {
-        if out[i].0 == [0u8; 24] {
+    for (i, slot) in out.iter_mut().enumerate().take(ASSIST_V5_CANDIDATES) {
+        if slot.0 == [0u8; 24] {
             let dummy = generate_dummy_candidate(i);
             let nonce = derive_entry_nonce_v5_improved(request_id, i, obf_key);
-            out[i] = BlindedCandidate::blind(&dummy, obf_key, &nonce);
+            *slot = BlindedCandidate::blind(&dummy, obf_key, &nonce);
         }
     }
 

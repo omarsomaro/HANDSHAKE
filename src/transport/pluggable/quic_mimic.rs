@@ -21,7 +21,7 @@ pub enum QuicVersion {
 }
 
 impl QuicVersion {
-    fn to_u32(&self) -> u32 {
+    fn to_u32(self) -> u32 {
         match self {
             QuicVersion::Q043 => 0x51303433, // "Q043" in hex
             QuicVersion::Q046 => 0x51303436, // "Q046" in hex
@@ -193,7 +193,7 @@ impl QuicMimic {
         chlo.extend_from_slice(b"CHLO");
 
         // Padding to avoid size-based fingerprinting
-        chlo.extend_from_slice(&vec![0u8; 32]);
+        chlo.extend_from_slice(&[0u8; 32]);
 
         // Version tag
         chlo.extend_from_slice(b"VER\"");

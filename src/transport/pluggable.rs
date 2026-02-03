@@ -135,7 +135,7 @@ impl PluggableTransport {
             use rand::seq::SliceRandom;
             cfg.pluggable_tls_domains
                 .choose(&mut rand::thread_rng())
-                .map(|s| s.clone())
+                .cloned()
                 .unwrap_or_else(|| "www.cloudflare.com".to_string())
         } else {
             "www.cloudflare.com".to_string()
@@ -393,7 +393,7 @@ impl FragmentedMessage {
 
 /// Divide data into labeled chunks for DNS multi-label transmission
 fn fragment_data(data: &[u8]) -> Vec<Vec<u8>> {
-    let total_chunks = ((data.len() + MAX_CHUNK_PAYLOAD - 1) / MAX_CHUNK_PAYLOAD) as u8;
+    let total_chunks = data.len().div_ceil(MAX_CHUNK_PAYLOAD) as u8;
     let mut chunks = Vec::new();
 
     for (i, chunk) in data.chunks(MAX_CHUNK_PAYLOAD).enumerate() {

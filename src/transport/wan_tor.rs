@@ -61,7 +61,7 @@ pub async fn try_tor_connect(
         // Generate deterministic username from isolation key for circuit isolation
         let mut username_bytes = [0u8; 16];
         rand::rngs::OsRng.fill_bytes(&mut username_bytes);
-        let username = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&username_bytes);
+        let username = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(username_bytes);
 
         tracing::debug!("Using circuit isolation with username: {}", username);
 
@@ -99,9 +99,8 @@ pub async fn try_tor_connect(
 async fn configure_tor_bridge(socks_addr: &str, bridge: &TorBridge) -> Result<()> {
     // Connect to Tor control port (derive from SOCKS address)
     let control_addr = socks_addr
-        .rsplitn(2, ':')
-        .nth(1)
-        .map(|host| format!("{}:9051", host))
+        .rsplit_once(':')
+        .map(|(host, _)| format!("{}:9051", host))
         .unwrap_or_else(|| "127.0.0.1:9051".to_string());
     let mut control_conn = TcpStream::connect(&control_addr)
         .await

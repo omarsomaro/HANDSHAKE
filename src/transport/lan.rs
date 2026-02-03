@@ -1,7 +1,7 @@
 use anyhow::Result;
-use std::net::{SocketAddr, IpAddr};
-use tokio::time::{Duration, Instant};
 use rand::RngCore;
+use std::net::{IpAddr, SocketAddr};
+use tokio::time::{Duration, Instant};
 
 const DISCOVERY_PREFIX: &[u8] = b"HS_DISCOVERY";
 const ACK_PREFIX: &[u8] = b"HS_DISCOVERY_ACK";
@@ -12,10 +12,10 @@ use tokio::net::UdpSocket;
 pub async fn try_lan_broadcast(port: u16) -> Result<(UdpSocket, SocketAddr)> {
     let bind_addr = SocketAddr::from(([0, 0, 0, 0], port));
     let sock = UdpSocket::bind(bind_addr).await?;
-    
+
     // Imposta broadcast per discovery
     sock.set_broadcast(true)?;
-    
+
     // Prova a inviare un pacchetto di discovery
     let broadcast_addr = SocketAddr::from(([255, 255, 255, 255], port));
     let mut nonce = [0u8; NONCE_LEN];
@@ -23,15 +23,16 @@ pub async fn try_lan_broadcast(port: u16) -> Result<(UdpSocket, SocketAddr)> {
     let mut discovery_packet = Vec::with_capacity(DISCOVERY_PREFIX.len() + NONCE_LEN);
     discovery_packet.extend_from_slice(DISCOVERY_PREFIX);
     discovery_packet.extend_from_slice(&nonce);
-    
+
     // Timeout per la risposta
     tokio::time::timeout(
         std::time::Duration::from_secs(1),
-        sock.send_to(&discovery_packet, broadcast_addr)
-    ).await??;
+        sock.send_to(&discovery_packet, broadcast_addr),
+    )
+    .await??;
 
     let peer = listen_for_discovery(&sock, nonce).await?;
-    
+
     tracing::debug!("LAN discovery broadcast sent on port {}", port);
     Ok((sock, peer))
 }
@@ -53,7 +54,10 @@ pub fn get_local_ip_addresses() -> anyhow::Result<Vec<IpAddr>> {
 }
 
 /// Ascolta per pacchetti di discovery LAN
-pub async fn listen_for_discovery(sock: &UdpSocket, own_nonce: [u8; NONCE_LEN]) -> Result<SocketAddr> {
+pub async fn listen_for_discovery(
+    sock: &UdpSocket,
+    own_nonce: [u8; NONCE_LEN],
+) -> Result<SocketAddr> {
     let mut buf = [0u8; 1024];
     let deadline = Instant::now() + Duration::from_secs(5);
 

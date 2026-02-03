@@ -3,13 +3,9 @@
 use handshacke::config::Config;
 use handshacke::transport::webrtc::WebRtcTransport;
 use std::sync::Arc;
-use tokio::time::{Duration, Instant, timeout};
+use tokio::time::{timeout, Duration, Instant};
 
-async fn forward_ice(
-    from: Arc<WebRtcTransport>,
-    to: Arc<WebRtcTransport>,
-    duration: Duration,
-) {
+async fn forward_ice(from: Arc<WebRtcTransport>, to: Arc<WebRtcTransport>, duration: Duration) {
     let deadline = Instant::now() + duration;
     loop {
         if Instant::now() >= deadline {
@@ -38,15 +34,24 @@ async fn test_webrtc_loopback_data_channel() {
     let (answerer, answer_sdp) = WebRtcTransport::connect_with_offer(&cfg, &offer_sdp)
         .await
         .expect("connect with offer");
-    offerer.set_remote_answer(&answer_sdp)
+    offerer
+        .set_remote_answer(&answer_sdp)
         .await
         .expect("set remote answer");
 
     let offerer = Arc::new(offerer);
     let answerer = Arc::new(answerer);
 
-    let fwd_a = tokio::spawn(forward_ice(offerer.clone(), answerer.clone(), Duration::from_secs(2)));
-    let fwd_b = tokio::spawn(forward_ice(answerer.clone(), offerer.clone(), Duration::from_secs(2)));
+    let fwd_a = tokio::spawn(forward_ice(
+        offerer.clone(),
+        answerer.clone(),
+        Duration::from_secs(2),
+    ));
+    let fwd_b = tokio::spawn(forward_ice(
+        answerer.clone(),
+        offerer.clone(),
+        Duration::from_secs(2),
+    ));
     let _ = tokio::join!(fwd_a, fwd_b);
 
     tokio::time::sleep(Duration::from_millis(200)).await;

@@ -1,11 +1,14 @@
-use chacha20poly1305::{XChaCha20Poly1305, KeyInit, XNonce, aead::{Aead, Payload}};
-use rand::RngCore;
-use serde::{Serialize, Deserialize};
-use std::time::{SystemTime, UNIX_EPOCH};
 use bincode::Options;
+use chacha20poly1305::{
+    aead::{Aead, Payload},
+    KeyInit, XChaCha20Poly1305, XNonce,
+};
 use hkdf::Hkdf;
+use rand::RngCore;
+use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const NONCE_DOMAIN_NOISE: u8 = 0x01;
 pub const NONCE_DOMAIN_APP: u8 = 0x02;
@@ -30,18 +33,14 @@ pub struct NonceSeq {
 
 impl NonceSeq {
     fn new_with_salt(key_enc: &[u8; 32], domain: u8, role: u8, salt: Option<&[u8; 32]>) -> Self {
-        let hk = Hkdf::<Sha256>::new(
-            Some(b"hs/xchacha20/nonce-prefix/v1"),
-            key_enc,
-        );
+        let hk = Hkdf::<Sha256>::new(Some(b"hs/xchacha20/nonce-prefix/v1"), key_enc);
         let mut prefix = [0u8; 16];
         let info = if let Some(salt) = salt {
             [b"boot:", &salt[..], b"|", &[domain], &[role]].concat()
         } else {
             vec![domain, role]
         };
-        hk.expand(&info, &mut prefix)
-            .expect("HKDF expand failed");
+        hk.expand(&info, &mut prefix).expect("HKDF expand failed");
         Self { prefix, ctr: 0 }
     }
 
@@ -58,7 +57,9 @@ impl NonceSeq {
     }
 
     pub fn next_nonce_and_seq(&mut self) -> anyhow::Result<([u8; 24], u64)> {
-        let ctr = self.ctr.checked_add(1)
+        let ctr = self
+            .ctr
+            .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("nonce counter overflow - consider key rotation"))?;
         self.ctr = ctr;
         let mut nonce = [0u8; 24];
@@ -73,9 +74,9 @@ impl NonceSeq {
     }
 }
 
-pub mod replay;
 #[cfg(feature = "pq")]
 pub mod post_quantum;
+pub mod replay;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ClearPayload {
@@ -165,13 +166,15 @@ pub fn pad_to_mtu(packet: &mut Vec<u8>) {
     // If packet is already >= MTU, leave it unchanged
 }
 
-
 pub fn deserialize_cipher_packet(bytes: &[u8]) -> anyhow::Result<CipherPacket> {
     deserialize_cipher_packet_with_limit(bytes, MAX_TCP_FRAME_BYTES)
 }
 
 /// Deserialize from wire; byte[2] == PROTOCOL_VERSION_V1 selects legacy V1 parsing.
-pub fn deserialize_cipher_packet_with_limit(bytes: &[u8], limit: u64) -> anyhow::Result<CipherPacket> {
+pub fn deserialize_cipher_packet_with_limit(
+    bytes: &[u8],
+    limit: u64,
+) -> anyhow::Result<CipherPacket> {
     if bytes.len() < 3 {
         anyhow::bail!("CipherPacket too short");
     }
@@ -201,14 +204,26 @@ pub fn deserialize_cipher_packet_with_limit(bytes: &[u8], limit: u64) -> anyhow:
 }
 
 /// Cifra un payload con XChaCha20Poly1305
-pub fn seal(key_enc: &[u8; 32], tag16: u16, tag8: u8, clear: &ClearPayload) -> anyhow::Result<CipherPacket> {
+pub fn seal(
+    key_enc: &[u8; 32],
+    tag16: u16,
+    tag8: u8,
+    clear: &ClearPayload,
+) -> anyhow::Result<CipherPacket> {
     let cipher = XChaCha20Poly1305::new(key_enc.into());
     let mut nonce = [0u8; 24];
     rand::rngs::OsRng.fill_bytes(&mut nonce);
 
     let aad = tag16.to_be_bytes();
     let plaintext = bincode::serialize(clear)?; // <-- usa anyhow::Result
-    let body = cipher.encrypt(XNonce::from_slice(&nonce), Payload { msg: &plaintext, aad: &aad })
+    let body = cipher
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: &plaintext,
+                aad: &aad,
+            },
+        )
         .map_err(|e| anyhow::anyhow!("encrypt failed: {:?}", e))?;
 
     Ok(CipherPacket {
@@ -242,7 +257,14 @@ pub fn seal_with_nonce(
     let cipher = XChaCha20Poly1305::new(key_enc.into());
     let aad = tag16.to_be_bytes();
     let plaintext = bincode::serialize(clear)?;
-    let body = cipher.encrypt(XNonce::from_slice(nonce), Payload { msg: &plaintext, aad: &aad })
+    let body = cipher
+        .encrypt(
+            XNonce::from_slice(nonce),
+            Payload {
+                msg: &plaintext,
+                aad: &aad,
+            },
+        )
         .map_err(|e| anyhow::anyhow!("encrypt failed: {:?}", e))?;
 
     Ok(CipherPacket {
@@ -255,7 +277,12 @@ pub fn seal_with_nonce(
 }
 
 /// Decifra un pacchetto se il tag corrisponde
-pub fn open(key_enc: &[u8; 32], pkt: &CipherPacket, expect_tag16: u16, expect_tag8: u8) -> Option<ClearPayload> {
+pub fn open(
+    key_enc: &[u8; 32],
+    pkt: &CipherPacket,
+    expect_tag16: u16,
+    expect_tag8: u8,
+) -> Option<ClearPayload> {
     // 1. Early drop: controllo tag (filtro DoS)
     if !ct_eq_u16(pkt.tag16, expect_tag16) {
         return None;
@@ -263,25 +290,30 @@ pub fn open(key_enc: &[u8; 32], pkt: &CipherPacket, expect_tag16: u16, expect_ta
     if pkt.version >= PROTOCOL_VERSION_V2 && pkt.tag8 != expect_tag8 {
         return None;
     }
-    
+
     // 2. Version check: supporto forward-compatible
     if pkt.version < MIN_SUPPORTED_VERSION || pkt.version > MAX_SUPPORTED_VERSION {
         tracing::warn!("Unsupported protocol version: {}", pkt.version);
         return None;
     }
-    
+
     // 3. Decrypt del payload
     let cipher = XChaCha20Poly1305::new(key_enc.into());
     let aad = expect_tag16.to_be_bytes();
-    let plaintext = cipher.decrypt(
-        XNonce::from_slice(&pkt.nonce), 
-        Payload { msg: &pkt.body, aad: &aad }
-    ).ok()?;
+    let plaintext = cipher
+        .decrypt(
+            XNonce::from_slice(&pkt.nonce),
+            Payload {
+                msg: &pkt.body,
+                aad: &aad,
+            },
+        )
+        .ok()?;
 
     if plaintext.len() > MAX_CLEAR_PAYLOAD_BYTES {
         return None;
     }
-    
+
     // 4. Deserialize payload
     let opts = bincode::DefaultOptions::new()
         .with_fixint_encoding()
@@ -377,7 +409,9 @@ mod tests {
             nonce: cipher_packet.nonce,
             body: cipher_packet.body.clone(),
         };
-        let bytes = cipher_bincode_opts(MAX_TCP_FRAME_BYTES).serialize(&v1).unwrap();
+        let bytes = cipher_bincode_opts(MAX_TCP_FRAME_BYTES)
+            .serialize(&v1)
+            .unwrap();
 
         let parsed = deserialize_cipher_packet(&bytes).unwrap();
         assert_eq!(parsed.version, PROTOCOL_VERSION_V1);
@@ -385,7 +419,6 @@ mod tests {
         let clear = open(&key, &parsed, tag, 0x42).unwrap();
         assert_eq!(payload.data, clear.data);
     }
-
 
     #[test]
     fn test_cipher_packet_v2_wire_layout() {
@@ -410,7 +443,7 @@ mod tests {
     #[test]
     fn test_replay_window() {
         let mut window = crate::crypto::replay::ReplayWindow::new();
-        
+
         // Prima sequenza - accettata
         assert!(window.check(100));
         // Duplicato - rifiutato
@@ -436,12 +469,12 @@ mod tests {
         };
 
         let start = std::time::Instant::now();
-        
+
         for _ in 0..1000 {
             let cipher_packet = seal(&key, tag, 0x42, &payload).unwrap();
             let _decrypted = open(&key, &cipher_packet, tag, 0x42).unwrap();
         }
-        
+
         let duration = start.elapsed();
         println!("1000 encryption/decryption cycles: {:?}", duration);
         assert!(duration < std::time::Duration::from_secs(1));

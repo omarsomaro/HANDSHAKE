@@ -1,44 +1,39 @@
 //! Transport layer: LAN -> WAN (Direct/Assist/Tor) with optional QUIC/WebRTC
 
-pub mod lan;
-pub mod wan;
-pub mod tasks;
-pub mod framing;
-pub mod wan_assist;
 pub mod assist_inbox;
-pub mod io;
-pub mod guaranteed;
-pub mod pluggable;
-pub mod stealth;
 pub mod dandelion;
+pub mod framing;
+pub mod guaranteed;
 pub mod ice;
-pub mod nat_detection;
-pub mod multipath;
-pub mod tcp_hole_punch;
 pub mod icmp_hole_punch;
+pub mod io;
+pub mod lan;
+pub mod multipath;
+pub mod nat_detection;
+pub mod pluggable;
 pub mod quic_rfc9000;
+pub mod stealth;
+pub mod tasks;
+pub mod tcp_hole_punch;
+pub mod wan;
+pub mod wan_assist;
 pub mod webrtc;
 
+pub use icmp_hole_punch::IcmpHolePunch;
+pub use tcp_hole_punch::TcpHolePunch;
 pub use wan::wan_direct;
 pub use wan::wan_tor;
-pub use tcp_hole_punch::TcpHolePunch;
-pub use icmp_hole_punch::IcmpHolePunch;
 
-use crate::config::{
-    Config,
-    WanMode,
-    UDP_MAX_PACKET_SIZE,
-    WAN_ASSIST_GLOBAL_TIMEOUT_SECS,
-};
+use crate::config::{Config, WanMode, UDP_MAX_PACKET_SIZE, WAN_ASSIST_GLOBAL_TIMEOUT_SECS};
 use crate::derive::RendezvousParams;
 use crate::offer::{OfferPayload, RoleHint};
-use crate::session_noise::NoiseRole;
 use crate::security::early_drop_packet;
+use crate::session_noise::NoiseRole;
 use anyhow::Result;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::net::UdpSocket;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::UdpSocket;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::time::{sleep, timeout, Duration};
 
@@ -60,7 +55,7 @@ pub enum Connection {
     Quic(Arc<crate::transport::quic_rfc9000::QuinnTransport>),
     /// WebRTC DataChannel (message-based)
     WebRtc(Arc<crate::transport::webrtc::WebRtcTransport>),
-// Tun variant removed - Noise is now a session layer
+    // Tun variant removed - Noise is now a session layer
 }
 
 impl Connection {
@@ -74,7 +69,7 @@ impl Connection {
             Connection::WebRtc(_) => None,
         }
     }
-    
+
     /// Check if this is a Tor stream connection
     pub fn is_tor_stream(&self) -> bool {
         matches!(self, Connection::WanTorStream { .. })
@@ -87,9 +82,14 @@ impl Connection {
             Connection::WanTorStream { .. } | Connection::Quic(_) | Connection::WebRtc(_)
         )
     }
-    
+
     /// Get Tor stream (only for Tor connections)
-    pub fn get_tor_stream(&self) -> Option<(Arc<TokioMutex<OwnedReadHalf>>, Arc<TokioMutex<OwnedWriteHalf>>)> {
+    pub fn get_tor_stream(
+        &self,
+    ) -> Option<(
+        Arc<TokioMutex<OwnedReadHalf>>,
+        Arc<TokioMutex<OwnedWriteHalf>>,
+    )> {
         match self {
             Connection::WanTorStream { reader, writer } => Some((reader.clone(), writer.clone())),
             _ => None,
@@ -108,7 +108,7 @@ impl Connection {
 }
 
 /// Establish connection with cascade strategy: LAN → WAN → TUN
-/// 
+///
 /// For WAN mode, uses config to determine Direct vs Tor transport.
 pub async fn establish_connection(p: &RendezvousParams, cfg: &Config) -> Result<Connection> {
     // 1. LAN
@@ -140,7 +140,12 @@ pub async fn establish_connection(p: &RendezvousParams, cfg: &Config) -> Result<
             }
 
             attempts += 1;
-            match timeout(Duration::from_secs(2), wan_assist::try_assisted_punch(p, &[relay.clone()], cfg)).await {
+            match timeout(
+                Duration::from_secs(2),
+                wan_assist::try_assisted_punch(p, &[relay.clone()], cfg),
+            )
+            .await
+            {
                 Ok(Ok(conn)) => {
                     tracing::info!("WAN Assist: success after {} attempts", attempts);
                     return Ok(conn);
@@ -149,7 +154,10 @@ pub async fn establish_connection(p: &RendezvousParams, cfg: &Config) -> Result<
                 Err(_) => tracing::warn!("Relay {} timeout", relay),
             }
         }
-        tracing::warn!("WAN Assist: all {} attempts failed, falling back to Tor", attempts);
+        tracing::warn!(
+            "WAN Assist: all {} attempts failed, falling back to Tor",
+            attempts
+        );
     }
 
     // 4. Tor fallback
@@ -190,9 +198,19 @@ async fn connection_from_wan(wan_conn: WanConnection) -> Result<Connection> {
 }
 
 /// Active dial to a specific target (WAN Direct or Tor).
-pub async fn connect_to(target: &str, params: &RendezvousParams, cfg: &Config) -> Result<Connection> {
+pub async fn connect_to(
+    target: &str,
+    params: &RendezvousParams,
+    cfg: &Config,
+) -> Result<Connection> {
     if target.contains(".onion") {
-        let stream = crate::transport::wan::wan_tor::try_tor_connect(&cfg.tor_socks_addr, target, None, Some(target)).await?;
+        let stream = crate::transport::wan::wan_tor::try_tor_connect(
+            &cfg.tor_socks_addr,
+            target,
+            None,
+            Some(target),
+        )
+        .await?;
         let (reader, writer) = stream.into_split();
         return Ok(Connection::WanTorStream {
             reader: Arc::new(TokioMutex::new(reader)),
@@ -206,7 +224,7 @@ pub async fn connect_to(target: &str, params: &RendezvousParams, cfg: &Config) -
 
     let probe = build_probe_packet(params.tag16);
     let burst = cfg.wan_probe_burst.max(1).min(10); // Limit max burst to prevent amplification
-    
+
     // Rate limiting: max 1 probe per 100ms per target to prevent amplification attacks
     let probe_interval = cfg.wan_probe_interval_ms.max(100);
     for i in 0..burst {
@@ -218,17 +236,26 @@ pub async fn connect_to(target: &str, params: &RendezvousParams, cfg: &Config) -
 
     let mut buf = vec![0u8; 1024];
     let timeout_ms = cfg.wan_connect_timeout_ms.max(1).min(10000); // Cap timeout to prevent resource exhaustion
-    
+
     match timeout(Duration::from_millis(timeout_ms), sock.recv_from(&mut buf)).await {
         Ok(Ok((n, from))) if from == peer && n >= 8 && n <= UDP_MAX_PACKET_SIZE => {
             // Additional validation: ensure response is reasonable size
             if !early_drop_packet(&buf[..n], params.tag16, params.tag8) {
-                tracing::debug!("UDP hole punching successful with {} bytes from {}", n, from);
+                tracing::debug!(
+                    "UDP hole punching successful with {} bytes from {}",
+                    n,
+                    from
+                );
                 return Ok(Connection::Wan(Arc::new(sock), peer));
             }
         }
         Ok(Ok((n, from))) => {
-            tracing::warn!("Invalid UDP response: {} bytes from {} (expected {})", n, from, peer);
+            tracing::warn!(
+                "Invalid UDP response: {} bytes from {} (expected {})",
+                n,
+                from,
+                peer
+            );
         }
         Ok(Err(e)) => {
             tracing::debug!("UDP receive error: {}", e);
@@ -245,7 +272,7 @@ fn build_probe_packet(tag16: u16) -> Vec<u8> {
     let mut v = Vec::with_capacity(1400);
     v.extend_from_slice(&tag16.to_le_bytes());
     v.extend_from_slice(b"PROBE");
-    
+
     // Pad to MTU for constant-size probe packets
     crate::crypto::pad_to_mtu(&mut v);
     v
@@ -319,4 +346,3 @@ pub async fn establish_connection_from_offer(
         peer,
     })
 }
-

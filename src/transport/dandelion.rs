@@ -3,12 +3,12 @@
 //! Aggregates multiple requests into batches to prevent timing correlation attacks
 //! where a compromised relay could deanonymize which client is talking to which peer.
 
+use crate::protocol_assist_v5::AssistRequestV5;
+use rand::Rng;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
-use rand::Rng;
-use crate::protocol_assist_v5::AssistRequestV5;
-use std::sync::Arc;
 
 /// Dandelion batch aggregation state
 #[derive(Clone)]
@@ -32,11 +32,16 @@ impl DandelionAggregator {
     }
 
     /// Add request to batch. Returns true if this was the first request in the batch (sets deadline)
-    pub async fn add_request(&self, tag: [u8; 8], request: AssistRequestV5, from: SocketAddr) -> bool {
+    pub async fn add_request(
+        &self,
+        tag: [u8; 8],
+        request: AssistRequestV5,
+        from: SocketAddr,
+    ) -> bool {
         let mut batches = self.batches.lock().await;
-        
+
         let is_first = !batches.contains_key(&tag);
-        
+
         let batch = batches.entry(tag).or_insert_with(|| {
             // Random delay 5-15 seconds
             let delay_secs = if cfg!(test) {
@@ -49,7 +54,7 @@ impl DandelionAggregator {
                 deadline: Instant::now() + Duration::from_secs(delay_secs),
             }
         });
-        
+
         batch.requests.push((request, from));
         is_first
     }
@@ -58,22 +63,22 @@ impl DandelionAggregator {
     pub async fn ready_batches(&self) -> Vec<(Vec<(AssistRequestV5, SocketAddr)>, [u8; 8])> {
         let mut batches = self.batches.lock().await;
         let now = Instant::now();
-        
+
         let mut ready = Vec::new();
         let mut to_remove = Vec::new();
-        
+
         for (tag, batch) in batches.iter() {
             if now >= batch.deadline {
                 ready.push((batch.requests.clone(), *tag));
                 to_remove.push(*tag);
             }
         }
-        
+
         // Clean up sent batches
         for tag in to_remove {
             batches.remove(&tag);
         }
-        
+
         ready
     }
 
@@ -95,10 +100,10 @@ pub fn dandelion_tag_for_request(req: &AssistRequestV5) -> [u8; 8] {
     if let Some(tag) = req.dandelion_tag {
         return tag;
     }
-    
+
     // Generate deterministic tag from request_id
     // Use first 8 bytes of SHA256(request_id) for determinism
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(req.request_id);
     let hash = hasher.finalize();
@@ -110,8 +115,8 @@ pub fn dandelion_tag_for_request(req: &AssistRequestV5) -> [u8; 8] {
 /// Configuration for Dandelion mode
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DandelionMode {
-    Off,        // No aggregation, immediate forwarding
-    LowLatency, // 2-5s delay, small batches
+    Off,          // No aggregation, immediate forwarding
+    LowLatency,   // 2-5s delay, small batches
     HighSecurity, // 10-15s delay, larger batches
 }
 
@@ -128,12 +133,12 @@ impl DandelionMode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[tokio::test]
     async fn test_dandelion_batching() {
         let aggregator = DandelionAggregator::new();
         let tag = [0x12, 0x34, 0x56, 0x78, 0x90, 0xAB, 0xCD, 0xEF];
-        
+
         // Add multiple requests to same batch
         for i in 0..3 {
             let mut req = AssistRequestV5 {
@@ -144,24 +149,24 @@ mod tests {
                 dandelion_tag: Some(tag),
                 mac: [0u8; 32],
             };
-            
+
             // Compute dummy MAC
             let mut mac = [0u8; 32];
             mac[0] = i;
             req.mac = mac;
-            
+
             let port = 1000u16 + i as u16;
             let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
             aggregator.add_request(tag, req, addr).await;
         }
-        
+
         // Should be empty immediately (not ready)
         let ready = aggregator.ready_batches().await;
         assert!(ready.is_empty());
-        
+
         // Wait for deadline
         tokio::time::sleep(Duration::from_secs(6)).await;
-        
+
         // Now should be ready
         let ready = aggregator.ready_batches().await;
         assert_eq!(ready.len(), 1);

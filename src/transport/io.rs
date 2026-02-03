@@ -34,7 +34,9 @@ impl TransportIo for ConnectionIo {
     }
 
     fn rate_limit_addr(&self) -> std::net::SocketAddr {
-        self.conn.peer_addr().unwrap_or_else(|| "0.0.0.0:0".parse().unwrap())
+        self.conn
+            .peer_addr()
+            .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap())
     }
 
     fn send<'a>(&'a self, data: Vec<u8>) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {

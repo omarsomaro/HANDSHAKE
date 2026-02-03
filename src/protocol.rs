@@ -1,9 +1,9 @@
-use serde::{Serialize, Deserialize};
-use crate::protocol_assist::{AssistRequest, AssistGo};
-use crate::protocol_assist_v5::{AssistRequestV5, AssistGoV5};
+use crate::protocol_assist::{AssistGo, AssistRequest};
+use crate::protocol_assist_v5::{AssistGoV5, AssistRequestV5};
+use serde::{Deserialize, Serialize};
 
 /// Control protocol for differentiating Handshake vs App data
-/// 
+///
 /// This enum is serialized and encrypted as the "ClearPayload" body.
 /// It wraps the actual inner content.
 #[derive(Serialize, Deserialize, Debug)]

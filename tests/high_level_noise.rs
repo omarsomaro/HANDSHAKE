@@ -1,6 +1,6 @@
 use anyhow::anyhow;
 use handshacke::crypto::MAX_TCP_FRAME_BYTES;
-use handshacke::session_noise::{run_noise_upgrade_io, NoiseRole, classic_noise_params};
+use handshacke::session_noise::{classic_noise_params, run_noise_upgrade_io, NoiseRole};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
@@ -65,7 +65,8 @@ async fn test_noise_upgrade_in_memory_roundtrip() {
             tag8,
             params,
             MAX_TCP_FRAME_BYTES,
-        ).await
+        )
+        .await
     });
 
     let b_task = tokio::spawn(async move {
@@ -79,10 +80,17 @@ async fn test_noise_upgrade_in_memory_roundtrip() {
             tag8,
             params,
             MAX_TCP_FRAME_BYTES,
-        ).await
+        )
+        .await
     });
 
-    let a_key = a_task.await.expect("initiator task").expect("initiator key");
-    let b_key = b_task.await.expect("responder task").expect("responder key");
+    let a_key = a_task
+        .await
+        .expect("initiator task")
+        .expect("initiator key");
+    let b_key = b_task
+        .await
+        .expect("responder task")
+        .expect("responder key");
     assert_eq!(a_key, b_key, "noise session keys must match");
 }

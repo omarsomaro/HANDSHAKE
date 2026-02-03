@@ -1,4 +1,4 @@
-use anyhow::{Result, bail, Context};
+use anyhow::{bail, Context, Result};
 
 const MIN_V3_ONION_LEN: usize = 56;
 const MAX_V3_ONION_LEN: usize = 62;
@@ -18,8 +18,7 @@ pub fn parse_onion_addr(target: &str) -> Result<(String, u16)> {
     let port_str = parts[0];
     let host = parts[1];
 
-    let port: u16 = port_str.parse()
-        .context("Invalid port in Tor address")?;
+    let port: u16 = port_str.parse().context("Invalid port in Tor address")?;
     if port == 0 {
         bail!("Invalid port in Tor address (cannot be 0)");
     }
@@ -43,7 +42,10 @@ pub fn parse_onion_addr(target: &str) -> Result<(String, u16)> {
             MAX_V3_ONION_LEN
         );
     }
-    if !host_no_suffix.chars().all(|c| matches!(c, 'a'..='z' | '2'..='7')) {
+    if !host_no_suffix
+        .chars()
+        .all(|c| matches!(c, 'a'..='z' | '2'..='7'))
+    {
         bail!("Invalid onion address characters (expected base32 lowercase: a-z, 2-7)");
     }
 

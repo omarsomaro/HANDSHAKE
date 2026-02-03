@@ -1,4 +1,4 @@
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -21,15 +21,15 @@ pub struct Chunk {
 pub fn split_chunks(id: u64, data: &[u8], max_chunk: usize) -> Vec<(ChunkHeader, Vec<u8>)> {
     let total = ((data.len() + max_chunk - 1) / max_chunk) as u16;
     let mut v = Vec::with_capacity(total as usize);
-    
+
     for (i, chunk) in data.chunks(max_chunk).enumerate() {
         v.push((
-            ChunkHeader { 
-                id: MsgId(id), 
-                idx: i as u16, 
-                total 
+            ChunkHeader {
+                id: MsgId(id),
+                idx: i as u16,
+                total,
             },
-            chunk.to_vec()
+            chunk.to_vec(),
         ));
     }
     v
@@ -42,28 +42,28 @@ pub struct Reassembler {
 }
 
 impl Reassembler {
-    pub fn new() -> Self { 
-        Self { 
-            buf: BTreeMap::new(), 
-            total: None 
-        } 
+    pub fn new() -> Self {
+        Self {
+            buf: BTreeMap::new(),
+            total: None,
+        }
     }
-    
+
     /// Aggiunge un chunk e ritorna il messaggio completo se tutti i chunk sono arrivati
     pub fn push(&mut self, hdr: &ChunkHeader, payload: Vec<u8>) -> Option<Vec<u8>> {
         self.buf.insert(hdr.idx, payload);
         self.total.get_or_insert(hdr.total);
-        
+
         if self.buf.len() == self.total.unwrap_or(0) as usize {
             let mut out = Vec::new();
-            for (_, part) in self.buf.iter() { 
-                out.extend_from_slice(part); 
+            for (_, part) in self.buf.iter() {
+                out.extend_from_slice(part);
             }
             return Some(out);
         }
         None
     }
-    
+
     /// Controlla se il riassemblatore è completo
     pub fn is_complete(&self) -> bool {
         if let Some(total) = self.total {
@@ -72,7 +72,7 @@ impl Reassembler {
             false
         }
     }
-    
+
     /// Resetta il riassemblatore
     pub fn clear(&mut self) {
         self.buf.clear();
@@ -89,19 +89,19 @@ mod tests {
         let data = b"Hello, this is a test message for chunking functionality!";
         let max_chunk = 10;
         let msg_id = 12345;
-        
+
         // Split in chunks
         let chunks = split_chunks(msg_id, data, max_chunk);
         assert!(chunks.len() > 1); // Dovrebbe essere diviso in più chunk
-        
+
         // Reassemble
         let mut reassembler = Reassembler::new();
         let mut result = None;
-        
+
         for (header, payload) in chunks {
             result = reassembler.push(&header, payload);
         }
-        
+
         assert!(result.is_some());
         assert_eq!(result.unwrap(), data.to_vec());
     }
@@ -111,16 +111,16 @@ mod tests {
         let data = b"Out of order test message";
         let max_chunk = 5;
         let msg_id = 54321;
-        
+
         let chunks = split_chunks(msg_id, data, max_chunk);
         let mut reassembler = Reassembler::new();
-        
+
         // Invia chunks in ordine inverso
         let mut result = None;
         for (header, payload) in chunks.into_iter().rev() {
             result = reassembler.push(&header, payload);
         }
-        
+
         assert!(result.is_some());
         assert_eq!(result.unwrap(), data.to_vec());
     }

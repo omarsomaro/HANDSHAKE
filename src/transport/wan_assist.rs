@@ -1,33 +1,34 @@
 //! WAN Assist: hole punching coordinato tramite relay temporaneo
 //! Zero-infrastructure, ephemeral, zero-trust
 
+use crate::config::UDP_MAX_PACKET_SIZE;
+use crate::protocol_assist_v5::{
+    compute_assist_mac_v5, derive_entry_nonce_v5_improved, derive_obfuscation_key_v5,
+    is_usable_candidate, make_blinded_candidates_v5_shuffled, verify_assist_go_mac_v5, AssistGoV5,
+    AssistRequestV5,
+};
 use crate::{
     config::Config,
-    crypto::{MAX_TCP_FRAME_BYTES, ClearPayload, seal_with_nonce, open, now_ms, serialize_cipher_packet, deserialize_cipher_packet_with_limit, NonceSeq, NONCE_DOMAIN_ASSIST},
+    crypto::{
+        deserialize_cipher_packet_with_limit, now_ms, open, seal_with_nonce,
+        serialize_cipher_packet, ClearPayload, NonceSeq, MAX_TCP_FRAME_BYTES, NONCE_DOMAIN_ASSIST,
+    },
     derive::RendezvousParams,
-    protocol_assist::{AssistRequest, AssistGo, TargetRef, compute_assist_mac},
     protocol::Control,
-    transport::{framing, lan, wan::{wan_tor, wan_direct}},
+    protocol_assist::{compute_assist_mac, AssistGo, AssistRequest, TargetRef},
+    transport::{
+        framing, lan,
+        wan::{wan_direct, wan_tor},
+    },
 };
-use crate::protocol_assist_v5::{
-    AssistRequestV5,
-    AssistGoV5,
-    derive_obfuscation_key_v5,
-    derive_entry_nonce_v5_improved,
-    make_blinded_candidates_v5_shuffled,
-    compute_assist_mac_v5,
-    verify_assist_go_mac_v5,
-    is_usable_candidate,
-};
-use anyhow::{Result, bail, Context, anyhow};
+use anyhow::{anyhow, bail, Context, Result};
+use rand::Rng;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::{TcpStream, UdpSocket};
-use tokio::time::{sleep, timeout, sleep_until};
-use rand::Rng;
-use crate::config::UDP_MAX_PACKET_SIZE;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::{TcpStream, UdpSocket};
+use tokio::time::{sleep, sleep_until, timeout};
 
 /// Generic relay stream trait
 pub trait RelayStream: AsyncRead + AsyncWrite + Unpin + Send {
@@ -47,13 +48,19 @@ pub async fn try_assisted_punch(
     cfg: &Config,
 ) -> Result<crate::transport::Connection> {
     for (idx, relay_onion) in relay_onions.iter().enumerate() {
-        tracing::info!("WAN Assist: trying relay {}/{}", idx + 1, relay_onions.len());
+        tracing::info!(
+            "WAN Assist: trying relay {}/{}",
+            idx + 1,
+            relay_onions.len()
+        );
 
         // 1. Connettiti a C via Tor
         let c_stream = match timeout(
             Duration::from_secs(cfg.wan_connect_timeout_ms.max(5000) / 1000),
-            wan_tor::try_tor_connect(&cfg.tor_socks_addr, relay_onion, None, Some(relay_onion))
-        ).await {
+            wan_tor::try_tor_connect(&cfg.tor_socks_addr, relay_onion, None, Some(relay_onion)),
+        )
+        .await
+        {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
                 tracing::warn!("Relay {} unreachable: {}", relay_onion, e);
@@ -95,13 +102,14 @@ async fn coordinate_with_relay(
     let ttl_ms = cfg.wan_connect_timeout_ms.min(10000) as u16;
     let (control, request_id) = if cfg.assist_obfuscation_v5 {
         let obf_key = derive_obfuscation_key_v5(&params.key_enc, params.tag16);
-        let blinded = make_blinded_candidates_v5_shuffled(&my_udp_candidates, &obf_key, &request_id);
+        let blinded =
+            make_blinded_candidates_v5_shuffled(&my_udp_candidates, &obf_key, &request_id);
         let mut request = AssistRequestV5 {
             request_id,
             blinded_candidates: blinded,
             ttl_ms,
-            dandelion_stem: false,  // Default: no Dandelion for V5
-            dandelion_tag: None,    // Default: relay generates tag
+            dandelion_stem: false, // Default: no Dandelion for V5
+            dandelion_tag: None,   // Default: relay generates tag
             mac: [0u8; 32],
         };
         request.mac = compute_assist_mac_v5(&params.key_enc, &request);
@@ -129,23 +137,31 @@ async fn coordinate_with_relay(
     };
     let pkt = seal_with_nonce(&params.key_enc, params.tag16, params.tag8, &clear, &nonce)?;
     let raw = serialize_cipher_packet(&pkt)?;
-    framing::write_frame(&mut c_writer, &raw).await
+    framing::write_frame(&mut c_writer, &raw)
+        .await
         .context("Failed to send AssistRequest")?;
 
     // 3. Ricevi AssistGo da C
     let go = timeout(Duration::from_millis(ttl_ms as u64 + 1000), async {
-        let frame = framing::read_frame(&mut c_reader).await
+        let frame = framing::read_frame(&mut c_reader)
+            .await
             .context("Failed to read AssistGo frame")?;
         let pkt = deserialize_cipher_packet_with_limit(&frame, MAX_TCP_FRAME_BYTES)?;
         let clear = open(&params.key_enc, &pkt, params.tag16, params.tag8)
             .ok_or_else(|| anyhow!("Invalid AssistGo MAC"))?;
         let ctrl: Control = bincode::deserialize(&clear.data)?;
         match (cfg.assist_obfuscation_v5, ctrl) {
-            (true, Control::AssistGoV5(go)) if go.request_id == request_id => Ok(AssistGoOrV5::V5(go)),
-            (false, Control::AssistGo(go)) if go.request_id == request_id => Ok(AssistGoOrV5::V4(go)),
+            (true, Control::AssistGoV5(go)) if go.request_id == request_id => {
+                Ok(AssistGoOrV5::V5(go))
+            }
+            (false, Control::AssistGo(go)) if go.request_id == request_id => {
+                Ok(AssistGoOrV5::V4(go))
+            }
             _ => bail!("Unexpected control message"),
         }
-    }).await.context("AssistGo timeout")??;
+    })
+    .await
+    .context("AssistGo timeout")??;
 
     // 4. Chiudi connessione a C
     drop(c_reader);
@@ -224,7 +240,10 @@ async fn gather_udp_candidates(port: u16) -> Result<Vec<SocketAddr>> {
 }
 
 /// Esegue burst UDP coordinato verso B
-async fn udp_burst_punch(go: &AssistGo, tag16: u16) -> anyhow::Result<crate::transport::Connection> {
+async fn udp_burst_punch(
+    go: &AssistGo,
+    tag16: u16,
+) -> anyhow::Result<crate::transport::Connection> {
     // Bind socket UDP
     let sock = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
 
@@ -278,14 +297,15 @@ async fn udp_burst_punch(go: &AssistGo, tag16: u16) -> anyhow::Result<crate::tra
 
     let result: Result<anyhow::Result<SocketAddr>, tokio::time::error::Elapsed> =
         timeout(Duration::from_millis(listen_timeout as u64), async {
-        loop {
-            let (n, from) = sock.recv_from(&mut buf).await?;
+            loop {
+                let (n, from) = sock.recv_from(&mut buf).await?;
 
-            if let Some(hit) = parse_tagged_sender(&buf, from, tag16, n)? {
-                return Ok::<SocketAddr, anyhow::Error>(hit);
+                if let Some(hit) = parse_tagged_sender(&buf, from, tag16, n)? {
+                    return Ok::<SocketAddr, anyhow::Error>(hit);
+                }
             }
-        }
-    }).await;
+        })
+        .await;
 
     // Attendi che burst finisca
     let _ = burst_handle.await;
@@ -305,8 +325,8 @@ pub mod coordination {
     use super::*;
     use crate::offer::OfferPayload;
     use std::time::{SystemTime, UNIX_EPOCH};
-    use tokio::io::{AsyncWriteExt, AsyncReadExt};
-    
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     /// Timestamped offer per sincronizzazione
     #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
     pub struct TimestampedOffer {
@@ -315,7 +335,7 @@ pub mod coordination {
         pub ntp_offset: Option<i64>,
         pub simultaneous_open: bool,
     }
-    
+
     /// Pubblica offerta sulla relay con timestamp
     pub async fn publish_offer_with_timestamp<S>(
         relay_stream: &mut S,
@@ -325,32 +345,33 @@ pub mod coordination {
     where
         S: tokio::io::AsyncWrite + Unpin + Send,
     {
-        
-        let timestamp_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_millis() as u64;
-        
+        let timestamp_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
+
         let timestamped = TimestampedOffer {
             offer_hash,
             timestamp_ms,
             ntp_offset: offer.ntp_offset,
             simultaneous_open: offer.simultaneous_open,
         };
-        
+
         // Serializza e invia
         let data = bincode::serialize(&timestamped)?;
         let len = data.len() as u32;
-        
+
         relay_stream.write_all(&len.to_be_bytes()).await?;
         relay_stream.write_all(&data).await?;
         relay_stream.flush().await?;
-        
-        tracing::debug!("Published timestamped offer: hash={}, ts={}, simultaneous={}", 
-            hex::encode(&offer_hash[..8]), timestamp_ms, offer.simultaneous_open);
-        
+
+        tracing::debug!(
+            "Published timestamped offer: hash={}, ts={}, simultaneous={}",
+            hex::encode(&offer_hash[..8]),
+            timestamp_ms,
+            offer.simultaneous_open
+        );
+
         Ok(())
     }
-    
+
     /// Leggi offerta del peer e calcola offset NTP-like
     pub async fn read_their_offer_and_sync<S>(
         relay_stream: &mut S,
@@ -358,32 +379,31 @@ pub mod coordination {
     where
         S: tokio::io::AsyncRead + Unpin + Send,
     {
-        
         // Leggi lunghezza
         let mut len_buf = [0u8; 4];
         relay_stream.read_exact(&mut len_buf).await?;
         let len = u32::from_be_bytes(len_buf) as usize;
-        
+
         // Leggi dati
         let mut data = vec![0u8; len];
         relay_stream.read_exact(&mut data).await?;
-        
+
         let their_offer: TimestampedOffer = bincode::deserialize(&data)?;
-        
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_millis() as u64;
-        
+
+        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
+
         let offset = (their_offer.timestamp_ms as i64) - (now_ms as i64);
-        
-        tracing::debug!("Read their offer: hash={}, ts={}, offset={}ms", 
-            hex::encode(&their_offer.offer_hash[..8]), 
-            their_offer.timestamp_ms, 
-            offset);
-        
+
+        tracing::debug!(
+            "Read their offer: hash={}, ts={}, offset={}ms",
+            hex::encode(&their_offer.offer_hash[..8]),
+            their_offer.timestamp_ms,
+            offset
+        );
+
         Ok((their_offer, offset))
     }
-    
+
     /// Coordinazione simultaneous open con rendezvous window
     pub async fn coordinate_simultaneous_open(
         my_offer: &OfferPayload,
@@ -394,47 +414,48 @@ pub mod coordination {
         // Connettiti al relay
         let relay_stream = timeout(
             Duration::from_secs(5),
-            wan_tor::try_tor_connect(&cfg.tor_socks_addr, relay, None, Some(relay))
-        ).await??;
-        
+            wan_tor::try_tor_connect(&cfg.tor_socks_addr, relay, None, Some(relay)),
+        )
+        .await??;
+
         let (mut reader, mut writer) = relay_stream.into_split();
-        
+
         // 1. Pubblica la nostra offerta con timestamp
         let my_hash = crate::crypto::hash_offer(my_offer);
         publish_offer_with_timestamp(&mut writer, my_offer, my_hash).await?;
-        
+
         // 2. Leggi la loro offerta e calcola offset
         let (their_offer, _offset) = read_their_offer_and_sync(&mut reader).await?;
-        
+
         // Verifica che sia l'offerta corretta
         if their_offer.offer_hash != their_hash {
-            bail!("Offer hash mismatch: expected {}, got {}", 
+            bail!(
+                "Offer hash mismatch: expected {}, got {}",
                 hex::encode(&their_hash[..8]),
-                hex::encode(&their_offer.offer_hash[..8]));
+                hex::encode(&their_offer.offer_hash[..8])
+            );
         }
-        
+
         // 3. Determina se possiamo fare simultaneous open
         if !their_offer.simultaneous_open || !my_offer.simultaneous_open {
             tracing::info!("Simultaneous open disabled, falling back to sequential");
             // Fallback a tentativi sequenziali
             return Err(anyhow!("Simultaneous open not enabled"));
         }
-        
+
         // 4. Calcola rendezvous time (30 secondi window)
         let rendezvous_window_ms = 30000u64;
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_millis() as u64;
-        
+        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
+
         // Applica offset per sincronizzazione
         let adjusted_now = if let Some(ntp_offset) = my_offer.ntp_offset {
             (now_ms as i64 + ntp_offset) as u64
         } else {
             now_ms
         };
-        
+
         let rendezvous_at_ms = adjusted_now + rendezvous_window_ms;
-        
+
         // 5. Attendi fino al rendezvous time
         let sleep_duration = if rendezvous_at_ms > now_ms {
             Duration::from_millis(rendezvous_at_ms - now_ms)
@@ -442,16 +463,19 @@ pub mod coordination {
             tracing::warn!("Rendezvous time is in the past, starting immediately");
             Duration::from_millis(100) // Breve delay
         };
-        
-        tracing::info!("Waiting for rendezvous at {} (in {}ms)", 
-            rendezvous_at_ms, sleep_duration.as_millis());
-        
+
+        tracing::info!(
+            "Waiting for rendezvous at {} (in {}ms)",
+            rendezvous_at_ms,
+            sleep_duration.as_millis()
+        );
+
         tokio::time::sleep(sleep_duration).await;
-        
+
         // 6. Esegui l'handshake simultaneo su tutti gli endpoint
         // Proviamo UPnP, STUN, e relay in parallelo
         tracing::info!("Starting simultaneous open handshake");
-        
+
         // Prepara i parametri
         let mut params = crate::derive::RendezvousParams {
             port: my_offer.rendezvous.port,
@@ -461,32 +485,39 @@ pub mod coordination {
             tag8: crate::derive::derive_tag8_from_key(&my_offer.rendezvous.key_enc),
             version: my_offer.ver,
         };
-        
+
         // Aggiungi offset per sincronizzazione
         if let Some(offset) = their_offer.ntp_offset {
             params.version = params.version.wrapping_add(offset as u8);
         }
-        
+
         // Prova hole punching simultaneo
         match crate::transport::wan_direct::try_direct_port_forward(params.port).await {
             Ok((sock, peer_addr)) => {
-                tracing::info!("Simultaneous open success via direct connection: {}", peer_addr);
+                tracing::info!(
+                    "Simultaneous open success via direct connection: {}",
+                    peer_addr
+                );
                 Ok(crate::transport::Connection::Wan(sock.into(), peer_addr))
             }
             Err(e) => {
-                tracing::warn!("Direct simultaneous open failed: {}, trying relay fallback", e);
-                
+                tracing::warn!(
+                    "Direct simultaneous open failed: {}, trying relay fallback",
+                    e
+                );
+
                 // Fallback: usa il relay corrente come mediatore
                 let relay_stream = timeout(
                     Duration::from_secs(5),
-                    wan_tor::try_tor_connect(&cfg.tor_socks_addr, relay, None, Some(relay))
-                ).await??;
-                
+                    wan_tor::try_tor_connect(&cfg.tor_socks_addr, relay, None, Some(relay)),
+                )
+                .await??;
+
                 coordinate_with_relay(relay_stream, &params, cfg).await
             }
         }
     }
-    
+
     /// Wrapper che prova simultaneo, fallback a sequenziale
     pub async fn try_simultaneous_or_sequential(
         my_offer: &OfferPayload,
@@ -499,11 +530,14 @@ pub mod coordination {
             match coordinate_simultaneous_open(my_offer, their_hash, &relay_onions[0], cfg).await {
                 Ok(conn) => return Ok(conn),
                 Err(e) => {
-                    tracing::warn!("Simultaneous open failed: {}, trying sequential relay attempts", e);
+                    tracing::warn!(
+                        "Simultaneous open failed: {}, trying sequential relay attempts",
+                        e
+                    );
                 }
             }
         }
-        
+
         // Fallback: tentativi sequenziali
         let params = crate::derive::RendezvousParams {
             port: my_offer.rendezvous.port,
@@ -513,7 +547,7 @@ pub mod coordination {
             tag8: crate::derive::derive_tag8_from_key(&my_offer.rendezvous.key_enc),
             version: my_offer.ver,
         };
-        
+
         try_assisted_punch(&params, relay_onions, cfg).await
     }
 }

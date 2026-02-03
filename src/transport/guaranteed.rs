@@ -19,12 +19,7 @@ struct RelayIo {
 }
 
 impl RelayIo {
-    fn new(
-        client: reqwest::Client,
-        relay_url: Url,
-        topics: Vec<String>,
-        wait_ms: u64,
-    ) -> Self {
+    fn new(client: reqwest::Client, relay_url: Url, topics: Vec<String>, wait_ms: u64) -> Self {
         Self {
             client,
             relay_url,
@@ -124,14 +119,14 @@ struct RelayRecv {
     data_b64: String,
 }
 
-fn derive_relay_topics(
-    key_enc: &[u8; 32],
-    tag16: u16,
-    window_ms: u64,
-) -> Vec<String> {
+fn derive_relay_topics(key_enc: &[u8; 32], tag16: u16, window_ms: u64) -> Vec<String> {
     let window_ms = window_ms.max(60_000);
     let now_ms = crate::crypto::now_ms();
-    let epoch = if window_ms == 0 { 0 } else { now_ms / window_ms };
+    let epoch = if window_ms == 0 {
+        0
+    } else {
+        now_ms / window_ms
+    };
     let mut topics = Vec::with_capacity(2);
     for e in [epoch, epoch.saturating_sub(1)] {
         let mut hasher = blake3::Hasher::new();
@@ -164,8 +159,8 @@ pub async fn establish_connection_guaranteed(
     if cfg.guaranteed_relay_url.is_empty() {
         anyhow::bail!("Guaranteed mode requires HANDSHACKE_GUARANTEED_RELAY_URL");
     }
-    let relay_url = Url::parse(&cfg.guaranteed_relay_url)
-        .context("Invalid HANDSHACKE_GUARANTEED_RELAY_URL")?;
+    let relay_url =
+        Url::parse(&cfg.guaranteed_relay_url).context("Invalid HANDSHACKE_GUARANTEED_RELAY_URL")?;
     let client = build_relay_client(cfg, egress)?;
     let topics = derive_relay_topics(
         &params.key_enc,

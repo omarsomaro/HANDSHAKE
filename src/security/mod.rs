@@ -1,13 +1,13 @@
+use lru_time_cache::LruCache;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tokio::time::{Instant, Duration};
-use lru_time_cache::LruCache;
+use tokio::time::{Duration, Instant};
 
 pub mod rate_limiting;
 pub mod time_validation;
 
-pub use rate_limiting::{TokenBucketLimiter, DoSProtector, DoSMetrics, RateLimiterMetrics};
+pub use rate_limiting::{DoSMetrics, DoSProtector, RateLimiterMetrics, TokenBucketLimiter};
 pub use time_validation::TimeValidator;
 
 /// Rate limiter token bucket con cleanup LRU per protezione DoS
@@ -106,7 +106,9 @@ pub fn early_drop_packet(packet: &[u8], expected_tag16: u16, expected_tag8: u8) 
         return true;
     }
     let version = packet[3];
-    if version < crate::crypto::MIN_SUPPORTED_VERSION || version > crate::crypto::MAX_SUPPORTED_VERSION {
+    if version < crate::crypto::MIN_SUPPORTED_VERSION
+        || version > crate::crypto::MAX_SUPPORTED_VERSION
+    {
         return true;
     }
     false
@@ -115,8 +117,8 @@ pub fn early_drop_packet(packet: &[u8], expected_tag16: u16, expected_tag8: u8) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::{now_ms, now_us, seal, serialize_cipher_packet, ClearPayload};
     use std::net::{IpAddr, Ipv4Addr};
-    use crate::crypto::{ClearPayload, seal, now_ms, now_us, serialize_cipher_packet};
 
     #[tokio::test]
     async fn test_rate_limiter() {
@@ -139,7 +141,7 @@ mod tests {
     #[test]
     fn test_early_drop_packet() {
         let expected_tag = 0x1337u16;
-        
+
         // Pacchetto V1 con tag corretto
         let good_v1_packet = [0x37, 0x13, 0x01, 0x02, 0x03];
         assert!(!early_drop_packet(&good_v1_packet, expected_tag, 0x42));

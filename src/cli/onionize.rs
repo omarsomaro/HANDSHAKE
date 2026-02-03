@@ -1,5 +1,8 @@
+use crate::config::TOR_SOCKS_WAIT_SECS;
+use crate::onion::validate_onion_addr;
 use anyhow::{anyhow, Context, Result};
 use clap::Args;
+use rand::RngCore;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -7,9 +10,6 @@ use std::time::{Duration, Instant};
 use tokio::fs;
 use tokio::net::TcpStream;
 use tokio::time::sleep;
-use rand::RngCore;
-use crate::config::TOR_SOCKS_WAIT_SECS;
-use crate::onion::validate_onion_addr;
 
 const DEFAULT_SOCKS_ADDR: &str = "127.0.0.1:9050";
 const DEFAULT_PORT: u16 = 9999;
@@ -74,7 +74,10 @@ async fn run_host_mode(args: &OnionizeArgs) -> Result<()> {
 }
 
 async fn run_client_mode(args: &OnionizeArgs) -> Result<()> {
-    let target = args.client.as_ref().ok_or_else(|| anyhow!("--client requires onion:port"))?;
+    let target = args
+        .client
+        .as_ref()
+        .ok_or_else(|| anyhow!("--client requires onion:port"))?;
     validate_onion_target(target)?;
 
     if let Err(e) = wait_for_socks(DEFAULT_SOCKS_ADDR, Duration::from_secs(2)).await {
@@ -144,7 +147,9 @@ async fn create_runtime_dir() -> Result<PathBuf> {
     let base = runtime_base_dir()?;
     let session_id = random_session_id();
     let path = base.join("runtime").join(session_id).join("tor");
-    fs::create_dir_all(&path).await.context("Failed to create runtime dir")?;
+    fs::create_dir_all(&path)
+        .await
+        .context("Failed to create runtime dir")?;
     Ok(path)
 }
 
@@ -171,13 +176,20 @@ async fn write_torrc_host(torrc_path: &Path, runtime_dir: &Path, port: u16) -> R
         port,
         port
     );
-    fs::write(torrc_path, torrc).await.context("Failed to write torrc")?;
+    fs::write(torrc_path, torrc)
+        .await
+        .context("Failed to write torrc")?;
     Ok(())
 }
 
 async fn write_torrc_client(torrc_path: &Path, runtime_dir: &Path) -> Result<()> {
-    let torrc = format!("DataDirectory \"{}\"\nSocksPort 9050\n", runtime_dir.display());
-    fs::write(torrc_path, torrc).await.context("Failed to write torrc")?;
+    let torrc = format!(
+        "DataDirectory \"{}\"\nSocksPort 9050\n",
+        runtime_dir.display()
+    );
+    fs::write(torrc_path, torrc)
+        .await
+        .context("Failed to write torrc")?;
     Ok(())
 }
 

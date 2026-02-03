@@ -1,16 +1,20 @@
+use crate::config::UDP_MAX_PACKET_SIZE;
+use crate::transport::io::{ConnectionIo, TransportIo};
 use crate::{
-    transport::Connection, 
-    api::Streams, 
-    crypto::{open, seal_with_nonce, deserialize_cipher_packet_with_limit, serialize_cipher_packet, ClearPayload, now_ms, MAX_UDP_PACKET_BYTES, MAX_CLEAR_PAYLOAD_BYTES, NonceSeq, NONCE_DOMAIN_APP}, 
+    api::Streams,
+    crypto::{
+        deserialize_cipher_packet_with_limit, now_ms, open, seal_with_nonce,
+        serialize_cipher_packet, ClearPayload, NonceSeq, MAX_CLEAR_PAYLOAD_BYTES,
+        MAX_UDP_PACKET_BYTES, NONCE_DOMAIN_APP,
+    },
+    protocol::Control,
     security::RateLimiter,
     state::MetricsCollector,
-    protocol::Control,
+    transport::Connection,
 };
-use crate::config::UDP_MAX_PACKET_SIZE;
-use tokio::sync::mpsc;
-use std::sync::Arc;
-use crate::transport::io::{TransportIo, ConnectionIo};
 use bincode::Options;
+use std::sync::Arc;
+use tokio::sync::mpsc;
 
 fn is_valid_app_role(role: u8) -> bool {
     matches!(role, 0x01 | 0x02)
@@ -34,7 +38,8 @@ pub async fn spawn_receiver_task_with_stop(
 ) -> tokio::task::JoinHandle<()> {
     if connection.is_stream() {
         let io = Arc::new(ConnectionIo::new(connection));
-        return spawn_receiver_task_with_stop_io(io, streams, cipher_params, rate_limiter, stop).await;
+        return spawn_receiver_task_with_stop_io(io, streams, cipher_params, rate_limiter, stop)
+            .await;
     }
 
     tokio::spawn(async move {
@@ -188,14 +193,15 @@ pub async fn spawn_sender_task_with_stop(
 ) -> tokio::task::JoinHandle<()> {
     if connection.is_stream() {
         let io = Arc::new(ConnectionIo::new(connection));
-        return spawn_sender_task_with_stop_io(io, rx_out, stop, metrics, cipher_params, app_role).await;
+        return spawn_sender_task_with_stop_io(io, rx_out, stop, metrics, cipher_params, app_role)
+            .await;
     }
 
     tokio::spawn(async move {
         let (key_enc, tag16, tag8) = cipher_params;
         debug_assert!(is_valid_app_role(app_role));
         let mut nonce_seq = NonceSeq::new(&key_enc, NONCE_DOMAIN_APP, app_role);
-        
+
         loop {
             tokio::select! {
                 _ = stop.changed() => {
@@ -224,12 +230,12 @@ pub async fn spawn_sender_task_with_stop(
                             seq,
                             data: payload_bytes,
                         };
-                        
+
                         let pkt = match seal_with_nonce(&key_enc, tag16, tag8, &clear, &nonce) {
                             Ok(p) => p,
                             Err(_) => continue,
                         };
-                        
+
                         let raw_bytes = match serialize_cipher_packet(&pkt) {
                             Ok(b) => b,
                             Err(_) => continue,

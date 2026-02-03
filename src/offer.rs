@@ -1,19 +1,22 @@
-use serde::{Serialize, Deserialize};
-use anyhow::{Result, bail, Context};
-use std::net::SocketAddr;
-use base64::{engine::general_purpose, Engine as _};
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
-use hkdf::Hkdf;
-use chacha20poly1305::{ChaCha20Poly1305, aead::{Aead, KeyInit}};
-use x25519_dalek::{PublicKey, StaticSecret, EphemeralSecret};
-use rand::RngCore;
-use crate::security::TimeValidator;
-use std::time::{SystemTime, UNIX_EPOCH};
-use bincode::Options;
 use crate::crypto::MAX_TCP_FRAME_BYTES;
-use zeroize::{Zeroize, ZeroizeOnDrop};
 use crate::onion::validate_onion_addr;
+use crate::security::TimeValidator;
+use anyhow::{bail, Context, Result};
+use base64::{engine::general_purpose, Engine as _};
+use bincode::Options;
+use chacha20poly1305::{
+    aead::{Aead, KeyInit},
+    ChaCha20Poly1305,
+};
+use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
+use rand::RngCore;
+use serde::{Deserialize, Serialize};
+use sha2::Sha256;
+use std::net::SocketAddr;
+use std::time::{SystemTime, UNIX_EPOCH};
+use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -67,7 +70,7 @@ pub struct OfferPayload {
     pub rendezvous: RendezvousInfo,
     pub per_ephemeral_salt: Option<[u8; 16]>, // ← Per-port randomization salt
     pub commit: [u8; 32],
-    pub timestamp: u64, // UNIX timestamp in ms for simultaneous open
+    pub timestamp: u64,          // UNIX timestamp in ms for simultaneous open
     pub ntp_offset: Option<i64>, // NTP offset after sync (None if not synced)
     pub simultaneous_open: bool, // Flag to enable simultaneous open
 }
@@ -95,9 +98,7 @@ impl OfferPayload {
         rendezvous: RendezvousInfo,
         ttl_s: u64,
     ) -> Result<Self> {
-        let issued_at_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_millis() as u64;
+        let issued_at_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
 
         let mut tor_ephemeral_pk = None;
         let mut tor_endpoint_enc = None;
@@ -108,9 +109,7 @@ impl OfferPayload {
             tor_endpoint_enc = Some(enc);
         }
 
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_millis() as u64;
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
 
         let mut offer = Self {
             ver: OFFER_VERSION,
@@ -121,7 +120,7 @@ impl OfferPayload {
             tor_ephemeral_pk,
             tor_endpoint_enc,
             rendezvous,
-            per_ephemeral_salt: None,  // ← Aggiunto
+            per_ephemeral_salt: None, // ← Aggiunto
             commit: [0u8; 32],
             timestamp,
             ntp_offset: None,
@@ -155,7 +154,7 @@ impl OfferPayload {
         mac.update(&offer.rendezvous.port.to_be_bytes());
         mac.update(&offer.rendezvous.tag16.to_be_bytes());
         mac.update(&offer.rendezvous.key_enc);
-        
+
         // Include ephemeral salt in commit if present
         if let Some(salt) = &offer.per_ephemeral_salt {
             mac.update(salt);
@@ -185,7 +184,8 @@ impl OfferPayload {
             if self.tor_ephemeral_pk.is_none() || self.tor_endpoint_enc.is_none() {
                 bail!("Tor endpoint present but encrypted tor data missing");
             }
-            let tor = self.tor_onion_addr()?
+            let tor = self
+                .tor_onion_addr()?
                 .ok_or_else(|| anyhow::anyhow!("Encrypted tor endpoint missing"))?;
             validate_onion_addr(&tor)?;
         }
@@ -209,7 +209,8 @@ impl OfferPayload {
     }
 
     pub fn decode(s: &str) -> Result<Self> {
-        let bytes = general_purpose::URL_SAFE_NO_PAD.decode(s)
+        let bytes = general_purpose::URL_SAFE_NO_PAD
+            .decode(s)
             .context("Base64 decode failed")?;
         bincode::DefaultOptions::new()
             .with_fixint_encoding()
@@ -220,7 +221,8 @@ impl OfferPayload {
     }
 
     pub fn expires_at_ms(&self) -> u64 {
-        self.issued_at_ms.saturating_add(self.ttl_s.saturating_mul(1000))
+        self.issued_at_ms
+            .saturating_add(self.ttl_s.saturating_mul(1000))
     }
 
     pub fn tor_onion_addr(&self) -> Result<Option<String>> {
@@ -230,16 +232,12 @@ impl OfferPayload {
         let Some(enc) = &self.tor_endpoint_enc else {
             return Ok(None);
         };
-        decrypt_tor_endpoint(&self.rendezvous.key_enc, self.rendezvous.tag16, pk, enc)
-            .map(Some)
+        decrypt_tor_endpoint(&self.rendezvous.key_enc, self.rendezvous.tag16, pk, enc).map(Some)
     }
 }
 
 pub fn derive_offer_key_v2(base_key: &[u8; 32], tag16: u16) -> Result<[u8; 32]> {
-    let hk = Hkdf::<Sha256>::new(
-        Some(b"handshacke-offer-v3"),
-        base_key,
-    );
+    let hk = Hkdf::<Sha256>::new(Some(b"handshacke-offer-v3"), base_key);
 
     let mut k_offer = [0u8; 32];
     let info = [b"offer-commit".as_slice(), &tag16.to_be_bytes()].concat();
@@ -248,7 +246,11 @@ pub fn derive_offer_key_v2(base_key: &[u8; 32], tag16: u16) -> Result<[u8; 32]> 
     Ok(k_offer)
 }
 
-fn encrypt_tor_endpoint(key_enc: &[u8; 32], tag16: u16, onion: &str) -> Result<([u8; 32], Vec<u8>)> {
+fn encrypt_tor_endpoint(
+    key_enc: &[u8; 32],
+    tag16: u16,
+    onion: &str,
+) -> Result<([u8; 32], Vec<u8>)> {
     let static_secret = derive_tor_static_secret(key_enc, tag16)?;
     let static_pk = PublicKey::from(&static_secret);
 
@@ -262,7 +264,8 @@ fn encrypt_tor_endpoint(key_enc: &[u8; 32], tag16: u16, onion: &str) -> Result<(
     let mut nonce = [0u8; 12];
     rand::thread_rng().fill_bytes(&mut nonce);
 
-    let ciphertext = cipher.encrypt(&nonce.into(), onion.as_bytes())
+    let ciphertext = cipher
+        .encrypt(&nonce.into(), onion.as_bytes())
         .map_err(|e| anyhow::anyhow!("Tor endpoint encrypt failed: {:?}", e))?;
 
     let mut enc = Vec::with_capacity(12 + ciphertext.len());
@@ -289,17 +292,15 @@ fn decrypt_tor_endpoint(
     let cipher = ChaCha20Poly1305::new((&key).into());
     let nonce = &enc[..12];
     let ciphertext = &enc[12..];
-    let plaintext = cipher.decrypt(nonce.into(), ciphertext)
+    let plaintext = cipher
+        .decrypt(nonce.into(), ciphertext)
         .map_err(|e| anyhow::anyhow!("Tor endpoint decrypt failed: {:?}", e))?;
     let onion = String::from_utf8(plaintext).context("Invalid tor endpoint utf8")?;
     Ok(onion)
 }
 
 fn derive_tor_static_secret(key_enc: &[u8; 32], tag16: u16) -> Result<StaticSecret> {
-    let hk = Hkdf::<Sha256>::new(
-        Some(b"handshacke-tor-static-v3"),
-        key_enc,
-    );
+    let hk = Hkdf::<Sha256>::new(Some(b"handshacke-tor-static-v3"), key_enc);
     let mut sk = [0u8; 32];
     let info = [b"tor-static".as_slice(), &tag16.to_be_bytes()].concat();
     hk.expand(&info, &mut sk)
@@ -308,10 +309,7 @@ fn derive_tor_static_secret(key_enc: &[u8; 32], tag16: u16) -> Result<StaticSecr
 }
 
 fn derive_tor_endpoint_key(shared: &[u8], tag16: u16) -> Result<[u8; 32]> {
-    let hk = Hkdf::<Sha256>::new(
-        Some(b"handshacke-tor-endpoint-v3"),
-        shared,
-    );
+    let hk = Hkdf::<Sha256>::new(Some(b"handshacke-tor-endpoint-v3"), shared);
     let mut key = [0u8; 32];
     let info = [b"tor-endpoint".as_slice(), &tag16.to_be_bytes()].concat();
     hk.expand(&info, &mut key)

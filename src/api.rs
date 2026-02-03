@@ -1,37 +1,51 @@
-use axum::{
-    Router,
-    routing::{post, get},
-    Json,
-    extract::{State, ConnectInfo, Extension},
-    response::{sse::{Event, Sse}, IntoResponse},
-    middleware::{from_fn_with_state, Next},
-};
+use axum::http::header::AUTHORIZATION;
 use axum::http::StatusCode;
-use std::convert::Infallible;
+use axum::http::{Request, StatusCode as AxumStatusCode};
+use axum::{
+    extract::{ConnectInfo, Extension, State},
+    middleware::{from_fn_with_state, Next},
+    response::{
+        sse::{Event, Sse},
+        IntoResponse,
+    },
+    routing::{get, post},
+    Json, Router,
+};
 use base64::{engine::general_purpose, Engine as _};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
-use std::{time::Duration, sync::Arc, net::SocketAddr};
-use tokio::{sync::{RwLock, mpsc}, time::{interval, timeout}};
-use tower::ServiceBuilder;
-use tower_http::{trace::TraceLayer, cors::{CorsLayer, Any}};
-use axum::http::{Request, StatusCode as AxumStatusCode};
-use axum::http::header::AUTHORIZATION;
+use std::convert::Infallible;
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 use subtle::ConstantTimeEq;
+use tokio::{
+    sync::{mpsc, RwLock},
+    time::{interval, timeout},
+};
+use tower::ServiceBuilder;
+use tower_http::{
+    cors::{Any, CorsLayer},
+    trace::TraceLayer,
+};
 
+use crate::onion::validate_onion_addr;
+use crate::phrase::PhraseInvite;
+use crate::transport::assist_inbox::{AssistInbox, AssistInboxRequest};
 use crate::{
-    config::{Config, ProductMode, WanMode, TorRole, GuaranteedEgress, DEFAULT_CHANNEL_CAPACITY, UDP_MAX_PACKET_SIZE},
-    state::{AppState, DebugMetrics, CryptoTimer},
+    config::{
+        Config, GuaranteedEgress, ProductMode, TorRole, WanMode, DEFAULT_CHANNEL_CAPACITY,
+        UDP_MAX_PACKET_SIZE,
+    },
+    crypto::{
+        deserialize_cipher_packet_with_limit, now_ms, now_us, open, seal, serialize_cipher_packet,
+        CipherPacket, ClearPayload, MAX_TCP_FRAME_BYTES, MAX_UDP_PACKET_BYTES,
+    },
     derive::{derive_from_secret, derive_tag8_from_key},
-    transport::{self, Connection},
-    crypto::{CipherPacket, ClearPayload, seal, open, now_ms, now_us, serialize_cipher_packet, deserialize_cipher_packet_with_limit, MAX_TCP_FRAME_BYTES, MAX_UDP_PACKET_BYTES},
-    security::{RateLimiter, TimeValidator},
     offer::{OfferPayload, RoleHint},
     protocol::Control,
+    security::{RateLimiter, TimeValidator},
+    state::{AppState, CryptoTimer, DebugMetrics},
+    transport::{self, Connection},
 };
-use crate::transport::assist_inbox::{AssistInbox, AssistInboxRequest};
-use crate::phrase::PhraseInvite;
-use crate::onion::validate_onion_addr;
 
 const PHRASE_VIRT_PORT: u16 = 443;
 
@@ -66,8 +80,7 @@ impl From<anyhow::Error> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
-        let code = StatusCode::from_u16(self.code)
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let code = StatusCode::from_u16(self.code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         (code, Json(self)).into_response()
     }
 }
@@ -100,8 +113,8 @@ pub struct ConnectionResponse {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct SendRequest { 
-    pub packet_b64: String 
+pub struct SendRequest {
+    pub packet_b64: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -128,29 +141,29 @@ pub struct PhraseStatusResponse {
     pub onion: Option<String>,
 }
 
-#[derive(Debug, Deserialize)] 
-struct SetPass { 
-    passphrase: String 
+#[derive(Debug, Deserialize)]
+struct SetPass {
+    passphrase: String,
 }
 
-#[derive(Debug, Deserialize)] 
-struct SealReq { 
-    data_b64: String 
+#[derive(Debug, Deserialize)]
+struct SealReq {
+    data_b64: String,
 }
 
-#[derive(Debug, Deserialize)] 
-struct OpenReq { 
-    packet_b64: String 
+#[derive(Debug, Deserialize)]
+struct OpenReq {
+    packet_b64: String,
 }
 
-#[derive(Debug, Serialize)]  
-struct SealRes { 
-    packet_b64: String 
+#[derive(Debug, Serialize)]
+struct SealRes {
+    packet_b64: String,
 }
 
-#[derive(Debug, Serialize)]  
-struct OpenRes { 
-    data_b64: String 
+#[derive(Debug, Serialize)]
+struct OpenRes {
+    data_b64: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -161,9 +174,9 @@ struct SetPassRes {
 }
 #[derive(Clone)]
 pub struct Streams {
-    pub tx: mpsc::Sender<Vec<u8>>,                 // RX→SSE
-    pub rx: Arc<tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>>,  // RX→SSE
-    pub tx_out: mpsc::Sender<Vec<u8>>,             // /send → sender task
+    pub tx: mpsc::Sender<Vec<u8>>,                            // RX→SSE
+    pub rx: Arc<tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>>, // RX→SSE
+    pub tx_out: mpsc::Sender<Vec<u8>>,                        // /send → sender task
 }
 
 #[derive(Clone)]
@@ -202,114 +215,115 @@ pub async fn create_api_server(
     bind: String,
     api_token: Option<String>,
 ) -> anyhow::Result<()> {
-
-/// Request for simultaneous open sync
-#[derive(Debug, Deserialize)]
-struct SimultaneousOpenRequest {
-    my_offer: String,      // Base64 encoded OfferPayload
-    their_hash: String,    // Base64 encoded offer hash (32 bytes)
-    relay_onion: String,   // Relay onion address
-}
-
-/// Response for simultaneous open sync
-#[derive(Debug, Serialize)]
-struct SimultaneousOpenResponse {
-    success: bool,
-    offset_ms: Option<i64>,
-    rendezvous_at: Option<u64>,
-    error: Option<String>,
-}
-
-/// Handle /v1/rendezvous/sync - Coordinate simultaneous open via relay
-async fn handle_simultaneous_open_sync(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    Extension(state): Extension<Arc<ApiState>>,
-    Json(req): Json<SimultaneousOpenRequest>,
-) -> Result<Json<SimultaneousOpenResponse>, StatusCode> {
-    if !state.app.api_allow(addr.ip(), 1.0).await {
-        return Err(StatusCode::TOO_MANY_REQUESTS);
+    /// Request for simultaneous open sync
+    #[derive(Debug, Deserialize)]
+    struct SimultaneousOpenRequest {
+        my_offer: String,    // Base64 encoded OfferPayload
+        their_hash: String,  // Base64 encoded offer hash (32 bytes)
+        relay_onion: String, // Relay onion address
     }
-    
-    // Create config local (like handle_connect line 418)
-    let cfg = Config::from_env();
-    
-    // Decode offer
-    let offer_bytes = match general_purpose::STANDARD.decode(&req.my_offer) {
-        Ok(b) => b,
-        Err(e) => {
-            return Ok(Json(SimultaneousOpenResponse {
-                success: false,
-                offset_ms: None,
-                rendezvous_at: None,
-                error: Some(format!("Invalid offer encoding: {}", e)),
-            }));
+
+    /// Response for simultaneous open sync
+    #[derive(Debug, Serialize)]
+    struct SimultaneousOpenResponse {
+        success: bool,
+        offset_ms: Option<i64>,
+        rendezvous_at: Option<u64>,
+        error: Option<String>,
+    }
+
+    /// Handle /v1/rendezvous/sync - Coordinate simultaneous open via relay
+    async fn handle_simultaneous_open_sync(
+        ConnectInfo(addr): ConnectInfo<SocketAddr>,
+        Extension(state): Extension<Arc<ApiState>>,
+        Json(req): Json<SimultaneousOpenRequest>,
+    ) -> Result<Json<SimultaneousOpenResponse>, StatusCode> {
+        if !state.app.api_allow(addr.ip(), 1.0).await {
+            return Err(StatusCode::TOO_MANY_REQUESTS);
         }
-    };
-    
-    let my_offer: OfferPayload = match bincode::deserialize(&offer_bytes) {
-        Ok(o) => o,
-        Err(e) => {
-            return Ok(Json(SimultaneousOpenResponse {
-                success: false,
-                offset_ms: None,
-                rendezvous_at: None,
-                error: Some(format!("Invalid offer: {}", e)),
-            }));
-        }
-    };
-    
-    // Decode hash (32 bytes)
-    let their_hash = match general_purpose::STANDARD.decode(&req.their_hash) {
-        Ok(h) if h.len() == 32 => {
-            let mut hash = [0u8; 32];
-            hash.copy_from_slice(&h);
-            hash
-        }
-        _ => {
-            return Ok(Json(SimultaneousOpenResponse {
-                success: false,
-                offset_ms: None,
-                rendezvous_at: None,
-                error: Some("Invalid hash: must be 32 bytes".to_string()),
-            }));
-        }
-    };
-    
-    // Use the WAN assist coordination module
-    let result = crate::transport::wan_assist::coordination::try_simultaneous_or_sequential(
-        &my_offer,
-        their_hash,
-        &[req.relay_onion],
-        &cfg,  // Use the cfg created above
-    ).await;
-    
-    match result {
-        Ok(_conn) => {
-            Ok(Json(SimultaneousOpenResponse {
-                success: true,
-                offset_ms: my_offer.ntp_offset,
-                rendezvous_at: Some(my_offer.timestamp + 30000), // 30 seconds
-                error: None,
-            }))
-        }
-        Err(e) => {
-            Ok(Json(SimultaneousOpenResponse {
+
+        // Create config local (like handle_connect line 418)
+        let cfg = Config::from_env();
+
+        // Decode offer
+        let offer_bytes = match general_purpose::STANDARD.decode(&req.my_offer) {
+            Ok(b) => b,
+            Err(e) => {
+                return Ok(Json(SimultaneousOpenResponse {
+                    success: false,
+                    offset_ms: None,
+                    rendezvous_at: None,
+                    error: Some(format!("Invalid offer encoding: {}", e)),
+                }));
+            }
+        };
+
+        let my_offer: OfferPayload = match bincode::deserialize(&offer_bytes) {
+            Ok(o) => o,
+            Err(e) => {
+                return Ok(Json(SimultaneousOpenResponse {
+                    success: false,
+                    offset_ms: None,
+                    rendezvous_at: None,
+                    error: Some(format!("Invalid offer: {}", e)),
+                }));
+            }
+        };
+
+        // Decode hash (32 bytes)
+        let their_hash = match general_purpose::STANDARD.decode(&req.their_hash) {
+            Ok(h) if h.len() == 32 => {
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(&h);
+                hash
+            }
+            _ => {
+                return Ok(Json(SimultaneousOpenResponse {
+                    success: false,
+                    offset_ms: None,
+                    rendezvous_at: None,
+                    error: Some("Invalid hash: must be 32 bytes".to_string()),
+                }));
+            }
+        };
+
+        // Use the WAN assist coordination module
+        let result = crate::transport::wan_assist::coordination::try_simultaneous_or_sequential(
+            &my_offer,
+            their_hash,
+            &[req.relay_onion],
+            &cfg, // Use the cfg created above
+        )
+        .await;
+
+        match result {
+            Ok(_conn) => {
+                Ok(Json(SimultaneousOpenResponse {
+                    success: true,
+                    offset_ms: my_offer.ntp_offset,
+                    rendezvous_at: Some(my_offer.timestamp + 30000), // 30 seconds
+                    error: None,
+                }))
+            }
+            Err(e) => Ok(Json(SimultaneousOpenResponse {
                 success: false,
                 offset_ms: my_offer.ntp_offset,
                 rendezvous_at: None,
                 error: Some(e.to_string()),
-            }))
+            })),
         }
     }
-}
 
-async fn handle_pluggable_protocols() -> impl axum::response::IntoResponse {
-    axum::Json(serde_json::json!({
-        "protocols": ["websocket", "quic", "http2", "none"]
-    }))
-}
+    async fn handle_pluggable_protocols() -> impl axum::response::IntoResponse {
+        axum::Json(serde_json::json!({
+            "protocols": ["websocket", "quic", "http2", "none"]
+        }))
+    }
 
-    let state = std::sync::Arc::new(ApiState { app: state, streams });
+    let state = std::sync::Arc::new(ApiState {
+        app: state,
+        streams,
+    });
     let mut app = Router::new()
         .route("/v1/connect", post(handle_connect))
         .route("/v1/status", get(handle_status))
@@ -344,7 +358,11 @@ async fn handle_pluggable_protocols() -> impl axum::response::IntoResponse {
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!("API server listening on http://{}", bind);
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -362,9 +380,7 @@ async fn require_bearer(
     let expected = format!("Bearer {}", token.as_str());
     let auth_bytes = auth_str.as_bytes();
     let expected_bytes = expected.as_bytes();
-    if auth_bytes.len() != expected_bytes.len()
-        || !bool::from(auth_bytes.ct_eq(expected_bytes))
-    {
+    if auth_bytes.len() != expected_bytes.len() || !bool::from(auth_bytes.ct_eq(expected_bytes)) {
         return AxumStatusCode::UNAUTHORIZED.into_response();
     }
     next.run(req).await
@@ -381,13 +397,22 @@ async fn handle_connect(
         return Err(connect_err(StatusCode::TOO_MANY_REQUESTS, "rate limit"));
     }
     if req.offer.is_some() && req.passphrase.is_some() {
-        return Err(connect_err(StatusCode::BAD_REQUEST, "provide either passphrase or offer, not both"));
+        return Err(connect_err(
+            StatusCode::BAD_REQUEST,
+            "provide either passphrase or offer, not both",
+        ));
     }
     if req.offer.is_some() && req.target.is_some() {
-        return Err(connect_err(StatusCode::BAD_REQUEST, "target not allowed with offer"));
+        return Err(connect_err(
+            StatusCode::BAD_REQUEST,
+            "target not allowed with offer",
+        ));
     }
     if req.target.is_some() && req.passphrase.is_none() {
-        return Err(connect_err(StatusCode::BAD_REQUEST, "passphrase required for target connect"));
+        return Err(connect_err(
+            StatusCode::BAD_REQUEST,
+            "passphrase required for target connect",
+        ));
     }
 
     let product_mode = req.product_mode;
@@ -395,7 +420,10 @@ async fn handle_connect(
     // Validate A/B request semantics
     if product_mode == ProductMode::Guaranteed {
         if req.target_onion.is_some() {
-            return Err(connect_err(StatusCode::BAD_REQUEST, "target_onion not allowed in guaranteed mode"));
+            return Err(connect_err(
+                StatusCode::BAD_REQUEST,
+                "target_onion not allowed in guaranteed mode",
+            ));
         }
     }
 
@@ -404,21 +432,30 @@ async fn handle_connect(
         && req.wan_mode == WanMode::Auto
         && req.tor_role == TorRole::Host
     {
-        return Err(connect_err(StatusCode::BAD_REQUEST, "Auto mode is only valid with TorRole::Client"));
+        return Err(connect_err(
+            StatusCode::BAD_REQUEST,
+            "Auto mode is only valid with TorRole::Client",
+        ));
     }
     if product_mode == ProductMode::Classic
         && (req.wan_mode == WanMode::Tor || req.wan_mode == WanMode::Auto)
         && req.tor_role == TorRole::Client
         && req.target_onion.is_none()
     {
-        return Err(connect_err(StatusCode::BAD_REQUEST, "target_onion required for Tor Client mode"));
+        return Err(connect_err(
+            StatusCode::BAD_REQUEST,
+            "target_onion required for Tor Client mode",
+        ));
     }
 
     // Validate target_onion format if provided (Classic only)
     if product_mode == ProductMode::Classic {
         if let Some(ref onion) = req.target_onion {
             if !onion.contains(':') || !onion.contains(".onion") {
-                return Err(connect_err(StatusCode::BAD_REQUEST, "target_onion must be in format 'address.onion:PORT'"));
+                return Err(connect_err(
+                    StatusCode::BAD_REQUEST,
+                    "target_onion must be in format 'address.onion:PORT'",
+                ));
             }
         }
     }
@@ -426,7 +463,10 @@ async fn handle_connect(
     // Guaranteed mode: relay-backed transport with optional Tor egress.
     if product_mode == ProductMode::Guaranteed {
         if req.offer.is_some() || req.target.is_some() || req.target_onion.is_some() {
-            return Err(connect_err(StatusCode::BAD_REQUEST, "offer/target not allowed in guaranteed mode"));
+            return Err(connect_err(
+                StatusCode::BAD_REQUEST,
+                "offer/target not allowed in guaranteed mode",
+            ));
         }
         let passphrase = match req.passphrase {
             Some(p) => SecretString::from(p),
@@ -580,14 +620,18 @@ async fn handle_connect(
             return Err(connect_err(StatusCode::BAD_REQUEST, "invalid request"));
         }
 
-        let local_role = req.local_role.unwrap_or_else(|| {
-            match offer.role_hint {
-                RoleHint::Host => RoleHint::Client,
-                RoleHint::Client => RoleHint::Host,
-            }
+        let local_role = req.local_role.unwrap_or_else(|| match offer.role_hint {
+            RoleHint::Host => RoleHint::Client,
+            RoleHint::Client => RoleHint::Host,
         });
 
-        let result = match transport::establish_connection_from_offer(&offer, &cfg, local_role.clone()).await {
+        let result = match transport::establish_connection_from_offer(
+            &offer,
+            &cfg,
+            local_role.clone(),
+        )
+        .await
+        {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("Offer connect failed: {:?}", e);
@@ -623,7 +667,8 @@ async fn handle_connect(
             (result.session_key, offer.rendezvous.tag16, tag8),
             rl,
             stop_rx1,
-        ).await;
+        )
+        .await;
 
         let stop_rx2 = stop_rx.clone();
         let metrics = app.get_metrics().await;
@@ -637,7 +682,8 @@ async fn handle_connect(
                 RoleHint::Host => 0x02,
                 RoleHint::Client => 0x01,
             },
-        ).await;
+        )
+        .await;
 
         let mode = result.mode.clone();
         let peer = result.peer.clone();
@@ -721,8 +767,10 @@ async fn handle_connect(
             &conn,
             &params.key_enc,
             params.tag16,
-            params.tag8
-        ).await {
+            params.tag8,
+        )
+        .await
+        {
             Ok(k) => k,
             Err(e) => {
                 tracing::error!("Noise handshake failed: {:?}", e);
@@ -747,36 +795,39 @@ async fn handle_connect(
 
         let mode = match &conn {
             Connection::Lan(_, _) => "lan",
-            Connection::Wan(_,_) => "wan",
+            Connection::Wan(_, _) => "wan",
             Connection::WanTorStream { .. } => "wan_tor",
             Connection::Quic(_) => "quic",
             Connection::WebRtc(_) => "webrtc",
-        }.to_string();
+        }
+        .to_string();
 
         let stop_rx1 = stop_rx.clone();
-        
+
         let _rx_handle = crate::transport::tasks::spawn_receiver_task_with_stop(
             conn.clone(),
             updated_streams.clone(),
             session_cipher_params,
             rl,
             stop_rx1,
-        ).await;
+        )
+        .await;
 
         let stop_rx2 = stop_rx.clone();
-        
+
         let metrics = app.get_metrics().await;
         let _tx_handle = crate::transport::tasks::spawn_sender_task_with_stop(
-            conn, 
-            rx_out, 
+            conn,
+            rx_out,
             stop_rx2,
             metrics,
             session_cipher_params,
             match noise_role {
                 crate::session_noise::NoiseRole::Initiator => 0x01,
                 crate::session_noise::NoiseRole::Responder => 0x02,
-            }
-        ).await;
+            },
+        )
+        .await;
 
         let peer = Some(target.clone());
         let mut s = app.get_connection_state().await;
@@ -786,9 +837,9 @@ async fn handle_connect(
         s.peer_address = peer.clone();
         app.set_connection_state(s).await;
 
-        return Ok(Json(ConnectionResponse { 
-            status: "connected".into(), 
-            port: Some(params.port), 
+        return Ok(Json(ConnectionResponse {
+            status: "connected".into(),
+            port: Some(params.port),
             mode,
             peer,
         }));
@@ -838,13 +889,10 @@ async fn handle_connect(
                 let noise_role = crate::session_noise::NoiseRole::Responder;
                 tokio::spawn(async move {
                     if let Err(e) = accept_wan_direct_and_spawn(
-                        sock,
-                        params_bg,
-                        cfg,
-                        state_bg,
-                        streams_bg,
-                        noise_role,
-                    ).await {
+                        sock, params_bg, cfg, state_bg, streams_bg, noise_role,
+                    )
+                    .await
+                    {
                         tracing::error!("WAN listen failed: {}", e);
                     }
                 });
@@ -870,15 +918,17 @@ async fn handle_connect(
                 &conn,
                 &params.key_enc,
                 params.tag16,
-                params.tag8
-            ).await {
+                params.tag8,
+            )
+            .await
+            {
                 Ok(k) => k,
                 Err(e) => {
                     tracing::error!("Noise handshake failed: {:?}", e);
                     return Err(connect_err(StatusCode::BAD_GATEWAY, "operation failed"));
                 }
             };
-            
+
             let session_cipher_params = (session_key, params.tag16, params.tag8);
             tracing::info!("Noise upgrade completed, session key installed");
 
@@ -899,38 +949,41 @@ async fn handle_connect(
 
             let mode = match &conn {
                 Connection::Lan(_, _) => "lan",
-                Connection::Wan(_,_) => "wan",
+                Connection::Wan(_, _) => "wan",
                 Connection::WanTorStream { .. } => "wan_tor",
                 Connection::Quic(_) => "quic",
                 Connection::WebRtc(_) => "webrtc",
-            }.to_string();
+            }
+            .to_string();
 
             // Avvia tasks con controlli di sicurezza
             let stop_rx1 = stop_rx.clone();
-            
+
             let _rx_handle = crate::transport::tasks::spawn_receiver_task_with_stop(
                 conn.clone(),
                 updated_streams.clone(),
                 session_cipher_params, // Updated
                 rl,
                 stop_rx1,
-            ).await;
+            )
+            .await;
 
             let stop_rx2 = stop_rx.clone();
-            
+
             let peer_addr = conn.peer_addr().map(|addr| addr.to_string());
             let metrics = app.get_metrics().await;
-        let _tx_handle = crate::transport::tasks::spawn_sender_task_with_stop(
-            conn, 
-            rx_out, 
-            stop_rx2,
-            metrics,
-            session_cipher_params, // Updated
-            match noise_role {
-                crate::session_noise::NoiseRole::Initiator => 0x01,
-                crate::session_noise::NoiseRole::Responder => 0x02,
-            }
-        ).await;
+            let _tx_handle = crate::transport::tasks::spawn_sender_task_with_stop(
+                conn,
+                rx_out,
+                stop_rx2,
+                metrics,
+                session_cipher_params, // Updated
+                match noise_role {
+                    crate::session_noise::NoiseRole::Initiator => 0x01,
+                    crate::session_noise::NoiseRole::Responder => 0x02,
+                },
+            )
+            .await;
 
             // Aggiorna stato
             let mut s = app.get_connection_state().await;
@@ -940,9 +993,9 @@ async fn handle_connect(
             s.peer_address = peer_addr.clone();
             app.set_connection_state(s).await;
 
-            Ok(Json(ConnectionResponse { 
-                status: "connected".into(), 
-                port: Some(params.port), 
+            Ok(Json(ConnectionResponse {
+                status: "connected".into(),
+                port: Some(params.port),
                 mode,
                 peer: peer_addr,
             }))
@@ -966,19 +1019,22 @@ async fn accept_wan_direct_and_spawn(
     streams: Streams,
     noise_role: crate::session_noise::NoiseRole,
 ) -> anyhow::Result<()> {
-    let (peer, first_pkt) = match wait_for_first_handshake_packet(&sock, &params, cfg.wan_accept_timeout_ms).await {
-        Ok(v) => v,
-        Err(e) => {
-            let mut s = state.get_connection_state().await;
-            if s.mode.as_deref() == Some("wan") && s.status == crate::state::ConnectionStatus::Connecting {
-                s.status = crate::state::ConnectionStatus::Disconnected;
-                s.mode = None;
-                s.peer_address = None;
-                state.set_connection_state(s).await;
+    let (peer, first_pkt) =
+        match wait_for_first_handshake_packet(&sock, &params, cfg.wan_accept_timeout_ms).await {
+            Ok(v) => v,
+            Err(e) => {
+                let mut s = state.get_connection_state().await;
+                if s.mode.as_deref() == Some("wan")
+                    && s.status == crate::state::ConnectionStatus::Connecting
+                {
+                    s.status = crate::state::ConnectionStatus::Disconnected;
+                    s.mode = None;
+                    s.peer_address = None;
+                    state.set_connection_state(s).await;
+                }
+                return Err(e);
             }
-            return Err(e);
-        }
-    };
+        };
     let first = Arc::new(RwLock::new(Some(first_pkt)));
     let sock_send = sock.clone();
     let send = move |data: Vec<u8>| {
@@ -997,7 +1053,7 @@ async fn accept_wan_direct_and_spawn(
                 return Ok(pkt);
             }
             loop {
-    let mut buf = vec![0u8; UDP_MAX_PACKET_SIZE];
+                let mut buf = vec![0u8; UDP_MAX_PACKET_SIZE];
                 let (n, from) = sock_recv.recv_from(&mut buf).await?;
                 if from != peer {
                     continue;
@@ -1017,11 +1073,15 @@ async fn accept_wan_direct_and_spawn(
         params.tag8,
         noise_params,
         MAX_UDP_PACKET_BYTES,
-    ).await {
+    )
+    .await
+    {
         Ok(k) => k,
         Err(e) => {
             let mut s = state.get_connection_state().await;
-            if s.mode.as_deref() == Some("wan") && s.status == crate::state::ConnectionStatus::Connecting {
+            if s.mode.as_deref() == Some("wan")
+                && s.status == crate::state::ConnectionStatus::Connecting
+            {
                 s.status = crate::state::ConnectionStatus::Disconnected;
                 s.mode = None;
                 s.peer_address = None;
@@ -1061,7 +1121,8 @@ async fn accept_wan_direct_and_spawn(
         session_cipher_params,
         rl,
         stop_rx1,
-    ).await;
+    )
+    .await;
 
     let stop_rx2 = stop_rx.clone();
     let metrics = state.get_metrics().await;
@@ -1074,8 +1135,9 @@ async fn accept_wan_direct_and_spawn(
         match noise_role {
             crate::session_noise::NoiseRole::Initiator => 0x01,
             crate::session_noise::NoiseRole::Responder => 0x02,
-        }
-    ).await;
+        },
+    )
+    .await;
 
     let mut s = state.get_connection_state().await;
     s.port = Some(params.port);
@@ -1116,7 +1178,9 @@ async fn wait_for_first_handshake_packet(
                 return Ok((from, buf[..n].to_vec()));
             }
         }
-    }).await.map_err(|_| anyhow::anyhow!("WAN listen timeout"))?
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("WAN listen timeout"))?
 }
 
 async fn handle_status(
@@ -1191,7 +1255,9 @@ async fn handle_recv_sse(
         }
     };
 
-    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::new()).into_response()
+    Sse::new(stream)
+        .keep_alive(axum::response::sse::KeepAlive::new())
+        .into_response()
 }
 
 async fn handle_set_passphrase(
@@ -1204,7 +1270,10 @@ async fn handle_set_passphrase(
     }
     let secret = SecretString::from(req.passphrase);
     let params = derive_from_secret(&secret);
-    state.app.set_crypto_params(params.key_enc, params.tag16, params.tag8).await;
+    state
+        .app
+        .set_crypto_params(params.key_enc, params.tag16, params.tag8)
+        .await;
     Ok(Json(SetPassRes {
         status: "ok".to_string(),
         port: params.port,
@@ -1220,22 +1289,22 @@ async fn handle_seal(
     if !state.app.api_allow(addr.ip(), 1.0).await {
         return axum::http::StatusCode::TOO_MANY_REQUESTS.into_response();
     }
-    let (key_enc, tag16, tag8) = match state.app.get_crypto_params().await { 
-        Some(p) => p, 
-        None => return axum::http::StatusCode::PRECONDITION_REQUIRED.into_response()
+    let (key_enc, tag16, tag8) = match state.app.get_crypto_params().await {
+        Some(p) => p,
+        None => return axum::http::StatusCode::PRECONDITION_REQUIRED.into_response(),
     };
-    
-    let data = match general_purpose::STANDARD.decode(&req.data_b64) { 
-        Ok(d) => d, 
-        Err(_) => return axum::http::StatusCode::BAD_REQUEST.into_response()
+
+    let data = match general_purpose::STANDARD.decode(&req.data_b64) {
+        Ok(d) => d,
+        Err(_) => return axum::http::StatusCode::BAD_REQUEST.into_response(),
     };
-    
-    let clear = ClearPayload { 
-        ts_ms: now_ms(), 
-        seq: now_us(), 
-        data 
+
+    let clear = ClearPayload {
+        ts_ms: now_ms(),
+        seq: now_us(),
+        data,
     };
-    
+
     // Utility endpoint: not for protocol frames. Uses random nonce.
     // Measure encrypt timing for metrics
     let timer = CryptoTimer::start();
@@ -1245,13 +1314,13 @@ async fn handle_seal(
             let metrics = state.app.get_metrics().await;
             metrics.record_encrypt_time(timer.elapsed()).await;
             p
-        },
-        Err(_) => return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+        Err(_) => return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
-    
+
     let packet_b64 = match serialize_cipher_packet(&pkt) {
         Ok(bytes) => general_purpose::STANDARD.encode(bytes),
-        Err(_) => return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        Err(_) => return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
     Json(SealRes { packet_b64 }).into_response()
 }
@@ -1264,28 +1333,32 @@ async fn handle_open(
     if !state.app.api_allow(addr.ip(), 1.0).await {
         return axum::http::StatusCode::TOO_MANY_REQUESTS.into_response();
     }
-    let (key_enc, tag16, tag8) = match state.app.get_crypto_params().await { 
-        Some(p) => p, 
-        None => return axum::http::StatusCode::PRECONDITION_REQUIRED.into_response()
+    let (key_enc, tag16, tag8) = match state.app.get_crypto_params().await {
+        Some(p) => p,
+        None => return axum::http::StatusCode::PRECONDITION_REQUIRED.into_response(),
     };
-    
-    let bytes = match general_purpose::STANDARD.decode(&req.packet_b64) { 
-        Ok(b) => b, 
-        Err(_) => return axum::http::StatusCode::BAD_REQUEST.into_response()
+
+    let bytes = match general_purpose::STANDARD.decode(&req.packet_b64) {
+        Ok(b) => b,
+        Err(_) => return axum::http::StatusCode::BAD_REQUEST.into_response(),
     };
-    
-    let pkt: CipherPacket = match deserialize_cipher_packet_with_limit(&bytes, MAX_TCP_FRAME_BYTES) { 
-        Ok(p) => p, 
-        Err(_) => return axum::http::StatusCode::BAD_REQUEST.into_response()
+
+    let pkt: CipherPacket = match deserialize_cipher_packet_with_limit(&bytes, MAX_TCP_FRAME_BYTES)
+    {
+        Ok(p) => p,
+        Err(_) => return axum::http::StatusCode::BAD_REQUEST.into_response(),
     };
-    
+
     // Measure decrypt timing for metrics
     let timer = CryptoTimer::start();
     if let Some(clear) = open(&key_enc, &pkt, tag16, tag8) {
         // Record successful decryption timing
         let metrics = state.app.get_metrics().await;
         metrics.record_decrypt_time(timer.elapsed()).await;
-        Json(OpenRes { data_b64: general_purpose::STANDARD.encode(clear.data) }).into_response()
+        Json(OpenRes {
+            data_b64: general_purpose::STANDARD.encode(clear.data),
+        })
+        .into_response()
     } else {
         // Record failed decryption (potential attack)
         let metrics = state.app.get_metrics().await;
@@ -1303,11 +1376,11 @@ async fn handle_disconnect(
     }
     state.app.stop_all().await;
     state.app.clear_crypto_params().await;
-    
+
     let mut current_state = state.app.get_connection_state().await;
     current_state.status = crate::state::ConnectionStatus::Disconnected;
     state.app.set_connection_state(current_state).await;
-    
+
     Ok(Json(ConnectionResponse {
         status: "disconnected".into(),
         port: None,
@@ -1332,7 +1405,8 @@ async fn handle_phrase_open(
     if app.get_phrase_status().await != crate::state::PhraseStatus::Closed {
         return Err(StatusCode::CONFLICT);
     }
-    app.set_phrase_status(crate::state::PhraseStatus::Opening).await;
+    app.set_phrase_status(crate::state::PhraseStatus::Opening)
+        .await;
 
     let cfg = Config::from_env();
     let passphrase = req.passphrase;
@@ -1360,7 +1434,8 @@ async fn handle_phrase_open(
 
     app.set_phrase_onion(Some(onion.clone())).await;
     app.set_phrase_listener(Some(listener.clone())).await;
-    app.set_phrase_status(crate::state::PhraseStatus::Open).await;
+    app.set_phrase_status(crate::state::PhraseStatus::Open)
+        .await;
 
     let invite = PhraseInvite {
         ver: 1,
@@ -1369,7 +1444,9 @@ async fn handle_phrase_open(
         onion: onion.clone(),
         virt_port: PHRASE_VIRT_PORT,
     };
-    let invite_str = invite.encode().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let invite_str = invite
+        .encode()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let state_bg = app.clone();
     let streams_bg = streams.clone();
@@ -1462,7 +1539,9 @@ async fn handle_phrase_open(
             s.peer_address = None;
             state_bg.set_connection_state(s).await;
 
-            state_bg.set_phrase_status(crate::state::PhraseStatus::Connected).await;
+            state_bg
+                .set_phrase_status(crate::state::PhraseStatus::Connected)
+                .await;
             break;
         }
     });
@@ -1496,7 +1575,10 @@ async fn handle_phrase_close(
         }
     }
     state.app.set_phrase_onion(None).await;
-    state.app.set_phrase_status(crate::state::PhraseStatus::Closed).await;
+    state
+        .app
+        .set_phrase_status(crate::state::PhraseStatus::Closed)
+        .await;
     let mut s = state.app.get_connection_state().await;
     s.status = crate::state::ConnectionStatus::Disconnected;
     state.app.set_connection_state(s).await;
@@ -1539,10 +1621,12 @@ async fn handle_phrase_join(
     let secret = SecretString::from(passphrase);
     let params = derive_from_secret(&secret);
 
-    app.set_phrase_status(crate::state::PhraseStatus::Opening).await;
-    let stream = crate::transport::wan_tor::try_tor_connect(&socks_addr, &target, None, Some(&target))
-        .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    app.set_phrase_status(crate::state::PhraseStatus::Opening)
+        .await;
+    let stream =
+        crate::transport::wan_tor::try_tor_connect(&socks_addr, &target, None, Some(&target))
+            .await
+            .map_err(|_| StatusCode::BAD_GATEWAY)?;
     let (reader, writer) = stream.into_split();
     let conn = Connection::WanTorStream {
         reader: Arc::new(tokio::sync::Mutex::new(reader)),
@@ -1561,7 +1645,8 @@ async fn handle_phrase_join(
     {
         Ok(k) => k,
         Err(_) => {
-            app.set_phrase_status(crate::state::PhraseStatus::Error("handshake_failed".into())).await;
+            app.set_phrase_status(crate::state::PhraseStatus::Error("handshake_failed".into()))
+                .await;
             return Err(StatusCode::BAD_GATEWAY);
         }
     };
@@ -1620,7 +1705,8 @@ async fn handle_phrase_join(
     s.peer_address = Some(invite.onion);
     app.set_connection_state(s).await;
 
-    app.set_phrase_status(crate::state::PhraseStatus::Connected).await;
+    app.set_phrase_status(crate::state::PhraseStatus::Connected)
+        .await;
 
     Ok(Json(ConnectionResponse {
         status: "connected".into(),
@@ -1660,7 +1746,7 @@ async fn handle_metrics(
     }
     let metrics = state.app.get_metrics().await;
     let debug_metrics = DebugMetrics::from_collector(&metrics).await;
-    
+
     Ok(Json(debug_metrics))
 }
 
@@ -1672,16 +1758,16 @@ async fn handle_circuit_status(
     if !state.app.api_allow(addr.ip(), 1.0).await {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
-    // For now return placeholder - ConnectionManager integration is next step  
-    use crate::state::{CircuitState, CircuitBreakerStatus};
-    
+    // For now return placeholder - ConnectionManager integration is next step
+    use crate::state::{CircuitBreakerStatus, CircuitState};
+
     let placeholder_status = CircuitBreakerStatus {
         state: CircuitState::Closed,
         failure_count: 0,
         success_count: 0,
         next_attempt_in: None,
     };
-    
+
     Ok(Json(placeholder_status))
 }
 

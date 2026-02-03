@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
+use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
-use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
 use tokio::net::UdpSocket;
 use tokio::select;
 use tokio::sync::Mutex;
@@ -10,10 +10,14 @@ use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::derive::RendezvousParams;
-use crate::offer::{OfferPayload, Endpoint, EndpointKind};
+use crate::offer::{Endpoint, EndpointKind, OfferPayload};
 use crate::session_noise::NoiseRole;
-use crate::transport::{self, Connection, nat_detection::{NatDetector, self}};
 use crate::transport::wan_tor;
+use crate::transport::{
+    self,
+    nat_detection::{self, NatDetector},
+    Connection,
+};
 
 #[derive(Debug, Clone)]
 pub struct IceCandidate {
@@ -106,11 +110,7 @@ impl IceAgent {
         let mut candidates = Vec::new();
 
         for stun_server in stun_servers.iter().take(3) {
-            match tokio::time::timeout(
-                Duration::from_secs(3),
-                self.stun_binding(stun_server),
-            )
-            .await
+            match tokio::time::timeout(Duration::from_secs(3), self.stun_binding(stun_server)).await
             {
                 Ok(Ok(Some(ext_addr))) => {
                     info!("STUN binding successful via {}: {}", stun_server, ext_addr);
@@ -138,36 +138,40 @@ impl IceAgent {
     }
 
     async fn stun_binding(&self, stun_server: &str) -> Result<Option<SocketAddr>> {
-        let local_sock = UdpSocket::bind("0.0.0.0:0").await.context("bind STUN local socket")?;
-        
+        let local_sock = UdpSocket::bind("0.0.0.0:0")
+            .await
+            .context("bind STUN local socket")?;
+
         let stun_addr: SocketAddr = stun_server.parse().context("parse STUN server address")?;
-        
+
         let mut buf = vec![0u8; 512];
-        
+
         let tx_id: [u8; 12] = rand::random();
         let binding_request = self.build_stun_binding_request(tx_id);
-        
+
         local_sock.send_to(&binding_request, stun_addr).await?;
-        
-        let (n, _) = tokio::time::timeout(Duration::from_secs(2), local_sock.recv_from(&mut buf)).await??;
-        
+
+        let (n, _) =
+            tokio::time::timeout(Duration::from_secs(2), local_sock.recv_from(&mut buf)).await??;
+
         let response = &buf[..n];
-        
+
         if response.len() < 20 || &response[0..2] != &[0x01, 0x01] {
             return Ok(None);
         }
-        
+
         let message_len = u16::from_be_bytes([response[2], response[3]]) as usize;
         if response.len() < 20 + message_len {
             return Ok(None);
         }
-        
+
         let mut offset = 20;
         while offset + 4 <= response.len() {
             let attr_type = u16::from_be_bytes([response[offset], response[offset + 1]]);
-            let attr_len = u16::from_be_bytes([response[offset + 2], response[offset + 3]]) as usize;
+            let attr_len =
+                u16::from_be_bytes([response[offset + 2], response[offset + 3]]) as usize;
             let padded_len = ((attr_len + 3) / 4) * 4;
-            
+
             if attr_type == 0x0020 {
                 if offset + 4 + attr_len <= response.len() && attr_len >= 8 {
                     let family = response[offset + 5];
@@ -183,10 +187,10 @@ impl IceAgent {
                     }
                 }
             }
-            
+
             offset += 4 + padded_len;
         }
-        
+
         Ok(None)
     }
 
@@ -236,9 +240,16 @@ impl IceAgent {
         let candidates = self.gather_candidates().await?;
 
         for candidate in candidates.clone().iter() {
-            if candidate.kind == IceCandidateKind::Lan || candidate.kind == IceCandidateKind::Upnp || candidate.kind == IceCandidateKind::Stun {
+            if candidate.kind == IceCandidateKind::Lan
+                || candidate.kind == IceCandidateKind::Upnp
+                || candidate.kind == IceCandidateKind::Stun
+            {
                 if let Some(addr) = candidate.addr {
-                    debug!("Testing {} candidate at {}", format!("{:?}", candidate.kind).to_lowercase(), addr);
+                    debug!(
+                        "Testing {} candidate at {}",
+                        format!("{:?}", candidate.kind).to_lowercase(),
+                        addr
+                    );
                 }
             }
         }
@@ -257,8 +268,9 @@ impl IceAgent {
             eligible.push(candidate);
         }
 
-        let futures: FuturesUnordered<BoxFuture<'static, Result<Option<(Connection, SocketAddr)>>>> =
-            FuturesUnordered::new();
+        let futures: FuturesUnordered<
+            BoxFuture<'static, Result<Option<(Connection, SocketAddr)>>>,
+        > = FuturesUnordered::new();
 
         for candidate in eligible {
             let agent = self.clone();
@@ -293,7 +305,7 @@ impl IceAgent {
 
         // Seleziona strategia basata su NAT type
         let strategy = nat_detection::NatDetector::select_strategy(nat_type);
-        
+
         for priority in strategy {
             match priority.kind {
                 crate::transport::nat_detection::TransportKind::Upnp if !priority.should_skip => {
@@ -354,31 +366,30 @@ impl IceAgent {
         let result = match candidate.kind {
             IceCandidateKind::Lan => {
                 if let Some(addr) = candidate.addr {
-                    self.attempt_udp_connection(addr, dispatch, EndpointKind::Lan).await
+                    self.attempt_udp_connection(addr, dispatch, EndpointKind::Lan)
+                        .await
                 } else {
                     Ok(None)
                 }
             }
             IceCandidateKind::Upnp => {
                 if let Some(addr) = candidate.addr {
-                    self.attempt_udp_connection(addr, dispatch, EndpointKind::Wan).await
+                    self.attempt_udp_connection(addr, dispatch, EndpointKind::Wan)
+                        .await
                 } else {
                     Ok(None)
                 }
             }
             IceCandidateKind::Stun => {
                 if let Some(addr) = candidate.addr {
-                    self.attempt_udp_connection(addr, dispatch, EndpointKind::Wan).await
+                    self.attempt_udp_connection(addr, dispatch, EndpointKind::Wan)
+                        .await
                 } else {
                     Ok(None)
                 }
             }
-            IceCandidateKind::Relay => {
-                self.attempt_relay().await
-            }
-            IceCandidateKind::Tor => {
-                self.attempt_tor().await
-            }
+            IceCandidateKind::Relay => self.attempt_relay().await,
+            IceCandidateKind::Tor => self.attempt_tor().await,
         };
 
         if result.is_err() {
@@ -482,10 +493,7 @@ impl IceAgent {
                         reader: Arc::new(Mutex::new(reader)),
                         writer: Arc::new(Mutex::new(writer)),
                     };
-                    return Ok(Some((
-                        conn,
-                        SocketAddr::from(([0, 0, 0, 0], 0)),
-                    )));
+                    return Ok(Some((conn, SocketAddr::from(([0, 0, 0, 0], 0)))));
                 }
                 Err(e) => {
                     warn!("Tor connection attempt failed: {}", e);
@@ -512,10 +520,18 @@ impl IceAgent {
         let attempts = attempted.get(kind).copied().unwrap_or(0);
 
         if attempts >= 3 {
-            warn!("ICE candidate {:?} exhausted after {} attempts", kind, attempts);
+            warn!(
+                "ICE candidate {:?} exhausted after {} attempts",
+                kind, attempts
+            );
         } else {
             let backoff_ms = 1000 * 2u64.pow(attempts as u32);
-            debug!("ICE candidate {:?} will retry in {}ms (attempt {})", kind, backoff_ms, attempts + 1);
+            debug!(
+                "ICE candidate {:?} will retry in {}ms (attempt {})",
+                kind,
+                backoff_ms,
+                attempts + 1
+            );
         }
     }
 
@@ -570,11 +586,15 @@ pub async fn establish_connection_from_candidate(
 
     let conn = match endpoint.kind {
         EndpointKind::Lan => {
-            let addr = endpoint.addr.ok_or_else(|| anyhow::anyhow!("LAN endpoint missing addr"))?;
+            let addr = endpoint
+                .addr
+                .ok_or_else(|| anyhow::anyhow!("LAN endpoint missing addr"))?;
             Connection::Lan(dispatch, addr)
         }
         EndpointKind::Wan => {
-            let addr = endpoint.addr.ok_or_else(|| anyhow::anyhow!("WAN endpoint missing addr"))?;
+            let addr = endpoint
+                .addr
+                .ok_or_else(|| anyhow::anyhow!("WAN endpoint missing addr"))?;
             Connection::Wan(dispatch, addr)
         }
         EndpointKind::Tor => {

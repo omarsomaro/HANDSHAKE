@@ -1,10 +1,10 @@
 #[cfg(feature = "quic")]
 mod imp {
-    use anyhow::{Result, anyhow, bail};
+    use anyhow::{anyhow, bail, Result};
     use quinn::{ClientConfig, Endpoint, ServerConfig};
     use rcgen::generate_simple_self_signed;
-    use rustls::RootCertStore;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use rustls::RootCertStore;
     use std::net::SocketAddr;
     use std::sync::Arc;
     use tokio::sync::Mutex;
@@ -74,7 +74,9 @@ mod imp {
                 *guard = Some(send);
             }
 
-            let send = guard.as_mut().ok_or_else(|| anyhow!("QUIC send stream missing"))?;
+            let send = guard
+                .as_mut()
+                .ok_or_else(|| anyhow!("QUIC send stream missing"))?;
             crate::transport::framing::write_frame(send, data).await
         }
 
@@ -90,7 +92,9 @@ mod imp {
                 *guard = Some(recv);
             }
 
-            let recv = guard.as_mut().ok_or_else(|| anyhow!("QUIC recv stream missing"))?;
+            let recv = guard
+                .as_mut()
+                .ok_or_else(|| anyhow!("QUIC recv stream missing"))?;
             crate::transport::framing::read_frame(recv).await
         }
 
@@ -136,7 +140,7 @@ mod imp {
 
 #[cfg(not(feature = "quic"))]
 mod imp {
-    use anyhow::{Result, bail};
+    use anyhow::{bail, Result};
     use std::net::SocketAddr;
 
     #[derive(Clone, Debug)]

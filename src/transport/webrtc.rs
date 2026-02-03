@@ -1,22 +1,25 @@
 #[cfg(feature = "webrtc")]
 mod imp {
-    use anyhow::{Result, anyhow, bail};
+    use anyhow::{anyhow, bail, Result};
     use bytes::Bytes;
     use serde_json;
-    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
     use tokio::sync::{mpsc, Mutex, Notify};
     use tokio::time::{timeout, Duration};
 
     use crate::config::Config;
 
-    use ::webrtc::api::APIBuilder;
-    use ::webrtc::api::media_engine::MediaEngine;
     use ::webrtc::api::interceptor_registry::register_default_interceptors;
-    use ::webrtc::interceptor::registry::Registry;
+    use ::webrtc::api::media_engine::MediaEngine;
+    use ::webrtc::api::APIBuilder;
     use ::webrtc::data_channel::data_channel_message::DataChannelMessage;
     use ::webrtc::data_channel::RTCDataChannel;
     use ::webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
     use ::webrtc::ice_transport::ice_server::RTCIceServer;
+    use ::webrtc::interceptor::registry::Registry;
     use ::webrtc::peer_connection::configuration::RTCConfiguration;
     use ::webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
     use ::webrtc::peer_connection::RTCPeerConnection;
@@ -37,7 +40,7 @@ mod imp {
     }
 
     impl WebRtcTransport {
-    pub async fn create_offer(cfg: &Config) -> Result<(Self, String)> {
+        pub async fn create_offer(cfg: &Config) -> Result<(Self, String)> {
             let api = build_api()?;
             let pc = Arc::new(api.new_peer_connection(rtc_config_from_config(cfg)).await?);
 
@@ -138,7 +141,7 @@ mod imp {
             rx.recv().await
         }
 
-    pub async fn send(&self, data: &[u8]) -> Result<()> {
+        pub async fn send(&self, data: &[u8]) -> Result<()> {
             self.wait_data_channel().await?;
             if data.len() > WEBRTC_MAX_MESSAGE_BYTES {
                 bail!(
@@ -149,7 +152,9 @@ mod imp {
             }
             let payload = Bytes::copy_from_slice(data);
             let dc = self.data_channel.lock().await;
-            let dc = dc.as_ref().ok_or_else(|| anyhow!("WebRTC data channel not ready"))?;
+            let dc = dc
+                .as_ref()
+                .ok_or_else(|| anyhow!("WebRTC data channel not ready"))?;
             dc.send(&payload).await?;
             Ok(())
         }
@@ -157,7 +162,9 @@ mod imp {
         pub async fn recv(&self) -> Result<Vec<u8>> {
             self.wait_data_channel().await?;
             let mut rx = self.rx.lock().await;
-            let rx = rx.as_mut().ok_or_else(|| anyhow!("WebRTC data channel not ready"))?;
+            let rx = rx
+                .as_mut()
+                .ok_or_else(|| anyhow!("WebRTC data channel not ready"))?;
             match rx.recv().await {
                 Some(data) => Ok(data),
                 None => bail!("WebRTC data channel closed"),
@@ -252,8 +259,8 @@ mod imp {
 
 #[cfg(not(feature = "webrtc"))]
 mod imp {
-    use anyhow::{Result, bail};
     use crate::config::Config;
+    use anyhow::{bail, Result};
 
     pub const WEBRTC_MAX_MESSAGE_BYTES: usize = 16 * 1024;
 

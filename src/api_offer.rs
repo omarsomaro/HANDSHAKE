@@ -2,18 +2,21 @@ use axum::{
     extract::{ConnectInfo, Extension},
     response::Json,
 };
-use serde::{Deserialize, Serialize};
-use std::net::{SocketAddr, IpAddr};
-use std::sync::Arc;
 use rand::RngCore;
 use secrecy::SecretString;
+use serde::{Deserialize, Serialize};
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 
-use crate::{
-    offer::{OfferPayload, RoleHint, Endpoint, EndpointKind, RendezvousInfo, DEFAULT_TTL_SECONDS, derive_offer_key_v2},
-    derive::{derive_from_secret, derive_from_passphrase_v2_stealth},
-    config::{Config, MIN_EPHEMERAL_PORT, MAX_PORT},
-};
 use crate::api::ApiError;
+use crate::{
+    config::{Config, MAX_PORT, MIN_EPHEMERAL_PORT},
+    derive::{derive_from_passphrase_v2_stealth, derive_from_secret},
+    offer::{
+        derive_offer_key_v2, Endpoint, EndpointKind, OfferPayload, RendezvousInfo, RoleHint,
+        DEFAULT_TTL_SECONDS,
+    },
+};
 
 type OfferResult = Result<Json<OfferResponse>, ApiError>;
 
@@ -47,7 +50,7 @@ pub async fn handle_offer_generate(
 
     // Check if stealth mode is requested via env var
     let stealth_mode = std::env::var("HANDSHACKE_STEALTH_PORT").is_ok();
-    
+
     let (rendezvous, per_ephemeral_salt) = match req.passphrase {
         Some(pass) => {
             if stealth_mode {
@@ -79,15 +82,14 @@ pub async fn handle_offer_generate(
                 key_enc: random_key(),
             };
             (info, None)
-        },
+        }
     };
 
     let mut endpoints = Vec::new();
-    let lan_eps = discover_lan_endpoints(rendezvous.port)
-        .map_err(|e| {
-            tracing::error!("Offer LAN discovery failed: {:?}", e);
-            ApiError::operation_failed()
-        })?;
+    let lan_eps = discover_lan_endpoints(rendezvous.port).map_err(|e| {
+        tracing::error!("Offer LAN discovery failed: {:?}", e);
+        ApiError::operation_failed()
+    })?;
     endpoints.extend(lan_eps);
 
     if let Ok((wan_ep, keepalive_sock)) = discover_wan_endpoint(rendezvous.port).await {
@@ -96,7 +98,11 @@ pub async fn handle_offer_generate(
     }
 
     let include_tor = req.include_tor.unwrap_or(false);
-    let tor_onion_addr = if include_tor { cfg.tor_onion_addr.clone() } else { None };
+    let tor_onion_addr = if include_tor {
+        cfg.tor_onion_addr.clone()
+    } else {
+        None
+    };
     if let Some(onion) = &tor_onion_addr {
         if tracing::level_enabled!(tracing::Level::DEBUG) {
             tracing::debug!("Offer Tor endpoint (debug): {}", onion);
@@ -115,12 +121,18 @@ pub async fn handle_offer_generate(
         return Err(ApiError::operation_failed());
     }
 
-    let mut offer = OfferPayload::new(role_hint, endpoints.clone(), tor_onion_addr, rendezvous, ttl_s)
-        .map_err(|e| {
-            tracing::error!("Offer build failed: {:?}", e);
-            ApiError::operation_failed()
-        })?;
-    
+    let mut offer = OfferPayload::new(
+        role_hint,
+        endpoints.clone(),
+        tor_onion_addr,
+        rendezvous,
+        ttl_s,
+    )
+    .map_err(|e| {
+        tracing::error!("Offer build failed: {:?}", e);
+        ApiError::operation_failed()
+    })?;
+
     // Set ephemeral salt if using stealth mode
     if let Some(salt) = per_ephemeral_salt {
         offer.per_ephemeral_salt = Some(salt);
@@ -128,19 +140,19 @@ pub async fn handle_offer_generate(
         let k_offer = derive_offer_key_v2(&offer.rendezvous.key_enc, offer.rendezvous.tag16)?;
         offer.commit = OfferPayload::compute_commit(&offer, &k_offer)?;
     }
-    let offer_str = offer.encode()
-        .map_err(|e| {
-            tracing::error!("Offer encode failed: {:?}", e);
-            ApiError::operation_failed()
-        })?;
+    let offer_str = offer.encode().map_err(|e| {
+        tracing::error!("Offer encode failed: {:?}", e);
+        ApiError::operation_failed()
+    })?;
 
-    let endpoints_display = endpoints.iter().map(|e| {
-        match (&e.kind, &e.addr) {
+    let endpoints_display = endpoints
+        .iter()
+        .map(|e| match (&e.kind, &e.addr) {
             (EndpointKind::Tor, _) => "tor".to_string(),
             (_, Some(addr)) => format!("{:?} {}", e.kind, addr),
             _ => format!("{:?}", e.kind),
-        }
-    }).collect();
+        })
+        .collect();
 
     Ok(Json(OfferResponse {
         offer: offer_str,
@@ -167,7 +179,9 @@ fn discover_lan_endpoints(port: u16) -> anyhow::Result<Vec<Endpoint>> {
     Ok(endpoints)
 }
 
-async fn discover_wan_endpoint(port: u16) -> anyhow::Result<(Endpoint, Arc<tokio::net::UdpSocket>)> {
+async fn discover_wan_endpoint(
+    port: u16,
+) -> anyhow::Result<(Endpoint, Arc<tokio::net::UdpSocket>)> {
     let (sock, ext_addr) = crate::transport::wan_direct::try_direct_port_forward(port).await?;
     let sock = Arc::new(sock);
 

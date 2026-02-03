@@ -1,12 +1,15 @@
-use anyhow::{Result, bail, anyhow};
-use crate::transport::Connection;
-use crate::protocol::Control;
-use crate::crypto::{self, open, seal_with_nonce, ClearPayload, deserialize_cipher_packet_with_limit, MAX_TCP_FRAME_BYTES, MAX_UDP_PACKET_BYTES, NonceSeq, NONCE_DOMAIN_NOISE};
+use crate::config::UDP_MAX_PACKET_SIZE;
 #[cfg(feature = "pq")]
 use crate::crypto::post_quantum::NOISE_PARAMS_PQ;
-use crate::config::UDP_MAX_PACKET_SIZE;
-use snow::{Builder, HandshakeState};
+use crate::crypto::{
+    self, deserialize_cipher_packet_with_limit, open, seal_with_nonce, ClearPayload, NonceSeq,
+    MAX_TCP_FRAME_BYTES, MAX_UDP_PACKET_BYTES, NONCE_DOMAIN_NOISE,
+};
+use crate::protocol::Control;
+use crate::transport::Connection;
+use anyhow::{anyhow, bail, Result};
 use rand::RngCore;
+use snow::{Builder, HandshakeState};
 use std::future::Future;
 
 const NOISE_PARAMS_CLASSIC: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
@@ -34,7 +37,7 @@ pub fn validate_protocol_transition(
     is_handshake_complete: bool,
 ) -> ProtocolValidation {
     use crate::protocol::Control;
-    
+
     match (current_state, message_type) {
         // Valid handshake messages during handshake
         (ProtocolState::Handshake, Control::NoiseHandshake(_)) => ProtocolValidation {
@@ -57,7 +60,7 @@ pub fn validate_protocol_transition(
                     error: Some("SessionKey received before handshake completion".to_string()),
                 }
             }
-        },
+        }
         // Invalid messages during handshake
         (ProtocolState::Handshake, Control::App(_)) => ProtocolValidation {
             is_valid: false,
@@ -101,16 +104,20 @@ pub fn validate_protocol_transition(
             state: ProtocolState::Transport,
             error: None,
         },
-        (ProtocolState::Transport, Control::AssistRequest(_) | Control::AssistGo(_)) => ProtocolValidation {
-            is_valid: true,
-            state: ProtocolState::Transport,
-            error: None,
-        },
-        (ProtocolState::Transport, Control::AssistRequestV5(_) | Control::AssistGoV5(_)) => ProtocolValidation {
-            is_valid: true,
-            state: ProtocolState::Transport,
-            error: None,
-        },
+        (ProtocolState::Transport, Control::AssistRequest(_) | Control::AssistGo(_)) => {
+            ProtocolValidation {
+                is_valid: true,
+                state: ProtocolState::Transport,
+                error: None,
+            }
+        }
+        (ProtocolState::Transport, Control::AssistRequestV5(_) | Control::AssistGoV5(_)) => {
+            ProtocolValidation {
+                is_valid: true,
+                state: ProtocolState::Transport,
+                error: None,
+            }
+        }
         // Invalid messages on closed connection
         (ProtocolState::Closed, _) => ProtocolValidation {
             is_valid: false,
@@ -241,15 +248,15 @@ pub fn pq_noise_params() -> Result<snow::params::NoiseParams> {
 }
 
 /// Run Noise handshake upgrade over an established connection.
-/// 
-/// Messages are encrypted with the `base_key` (derived from passphrase) 
+///
+/// Messages are encrypted with the `base_key` (derived from passphrase)
 /// wrapping a `Control::NoiseHandshake` payload.
 pub async fn run_noise_upgrade(
     role: NoiseRole,
     conn: &Connection,
     base_key: &[u8; 32],
     tag16: u16,
-    tag8: u8
+    tag8: u8,
 ) -> Result<[u8; 32]> {
     let limit = max_packet_limit(conn);
     let params = select_noise_params(conn)?;
@@ -262,7 +269,8 @@ pub async fn run_noise_upgrade(
         tag8,
         params,
         limit,
-    ).await
+    )
+    .await
 }
 
 pub async fn run_noise_upgrade_io<FSend, FRecv, FS, FR>(
@@ -326,29 +334,33 @@ where
             tracing::debug!("Sent Noise handshake message ({} bytes)", len);
         } else {
             let raw_bytes = recv().await?;
-            
+
             // Importante: controllo dimensione dal primo file
             if raw_bytes.len() > limit as usize {
                 bail!("Message too large: {} > {} bytes", raw_bytes.len(), limit);
             }
-            
+
             let pkt = deserialize_cipher_packet_with_limit(&raw_bytes, limit)?;
-            let clear = open(base_key, &pkt, tag16, tag8)
-                .ok_or_else(|| anyhow!("Noise handshake: Invalid base packet tag or decryption failed"))?;
+            let clear = open(base_key, &pkt, tag16, tag8).ok_or_else(|| {
+                anyhow!("Noise handshake: Invalid base packet tag or decryption failed")
+            })?;
 
             let ctrl: Control = bincode::deserialize(&clear.data)?;
-            
+
             // Usa la validazione del protocollo
             let validation = validate_protocol_transition(
                 ProtocolState::Handshake,
                 &ctrl,
                 false, // handshake non ancora completato
             );
-            
+
             if !validation.is_valid {
-                bail!("Protocol violation: {}", validation.error.unwrap_or_default());
+                bail!(
+                    "Protocol violation: {}",
+                    validation.error.unwrap_or_default()
+                );
             }
-            
+
             match ctrl {
                 Control::NoiseHandshake(msg) => {
                     if msg.is_empty() || msg.len() > MAX_NOISE_MESSAGE_BYTES {
@@ -385,18 +397,21 @@ where
             let raw = recv().await?;
             let len = transport.read_message(&raw, &mut buf)?;
             let ctrl: Control = bincode::deserialize(&buf[..len])?;
-            
+
             // Validazione per il SessionKey
             let validation = validate_protocol_transition(
                 ProtocolState::Handshake,
                 &ctrl,
                 true, // handshake completato
             );
-            
+
             if !validation.is_valid {
-                bail!("Protocol violation: {}", validation.error.unwrap_or_default());
+                bail!(
+                    "Protocol violation: {}",
+                    validation.error.unwrap_or_default()
+                );
             }
-            
+
             match ctrl {
                 Control::SessionKey(sk) => {
                     tracing::debug!("Session key received over Noise channel");

@@ -1,7 +1,7 @@
 //! Control protocol per WAN Assist (hole punching coordinato)
 //! Zero-infrastructure, ephemeral, zero-trust
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
 /// A → C: chiedi assistenza per hole punching verso B
@@ -38,9 +38,9 @@ pub struct AssistGo {
 /// Profilo di punch (robusto ma non aggressivo)
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PunchProfile {
-    pub pps: u16,         // packets per second (es. 30)
-    pub jitter_ms: u16,   // ±jitter per pacchetto (es. 50)
-    pub probe_size: u16,  // bytes per probe (es. 64)
+    pub pps: u16,        // packets per second (es. 30)
+    pub jitter_ms: u16,  // ±jitter per pacchetto (es. 50)
+    pub probe_size: u16, // bytes per probe (es. 64)
 }
 
 /// Calcola HMAC su AssistRequest (deterministico, no bincode)

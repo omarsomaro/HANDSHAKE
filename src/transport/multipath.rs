@@ -2,7 +2,7 @@
 //!
 //! Supports redundant and split mode for reliability and bandwidth aggregation
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -85,11 +85,11 @@ impl TransportHandle {
             metadata: Arc::new(Mutex::new(metadata)),
         }
     }
-    
+
     pub async fn metadata(&self) -> PathMetadata {
         self.metadata.lock().await.clone()
     }
-    
+
     pub async fn update_metadata<F>(&self, f: F)
     where
         F: FnOnce(&mut PathMetadata),
@@ -118,18 +118,18 @@ impl MultipathConnection {
             switch_threshold_ms,
         }
     }
-    
+
     /// Add a new path to the connection
     pub fn add_path(&mut self, transport: Connection, metadata: PathMetadata) {
         let handle = TransportHandle::new(transport, metadata);
         self.paths.push(handle);
-        
+
         // Set primary if this is the first path
         if self.paths.len() == 1 {
             self.primary_idx = 0;
         }
     }
-    
+
     /// Update path quality metrics
     pub async fn update_path_quality(
         &mut self,
@@ -140,43 +140,45 @@ impl MultipathConnection {
         if path_idx >= self.paths.len() {
             bail!("Path index {} out of bounds", path_idx);
         }
-        
+
         let handle = &self.paths[path_idx];
-        handle.update_metadata(|meta| {
-            meta.rtt_ms = rtt_ms;
-            meta.loss_rate = loss_rate.min(1.0).max(0.0);
-        }).await;
-        
+        handle
+            .update_metadata(|meta| {
+                meta.rtt_ms = rtt_ms;
+                meta.loss_rate = loss_rate.min(1.0).max(0.0);
+            })
+            .await;
+
         // Auto-switch to better path if needed
         if path_idx != self.primary_idx {
             let primary_score = self.paths[self.primary_idx].metadata().await.score();
             let new_score = self.paths[path_idx].metadata().await.score();
-            
+
             // Switch if significantly better
             if new_score > primary_score * 1.2 {
-                tracing::info!("Switching primary path from {} to {}", self.primary_idx, path_idx);
+                tracing::info!(
+                    "Switching primary path from {} to {}",
+                    self.primary_idx,
+                    path_idx
+                );
                 self.primary_idx = path_idx;
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Send data using multipath coordination
-    pub async fn send_multipath(
-        &self,
-        data: &[u8],
-        routing: &RoutingPolicy,
-    ) -> Result<()> {
+    pub async fn send_multipath(&self, data: &[u8], routing: &RoutingPolicy) -> Result<()> {
         if self.paths.is_empty() {
             bail!("No active paths");
         }
-        
+
         // Single path optimization
         if self.paths.len() == 1 {
             return self.send_single_path(0, data).await;
         }
-        
+
         match self.scheduler {
             SchedulerPolicy::Redundant => {
                 match routing {
@@ -189,7 +191,7 @@ impl MultipathConnection {
                                 futures.push(self.send_single_path(idx, data));
                             }
                         }
-                        
+
                         // Wait for at least one success
                         let results = futures::future::join_all(futures).await;
                         if let Some(Ok(_)) = results.iter().find(|r| r.is_ok()) {
@@ -204,79 +206,76 @@ impl MultipathConnection {
                     }
                 }
             }
-            SchedulerPolicy::Split => {
-                self.send_split(data, routing).await
-            }
+            SchedulerPolicy::Split => self.send_split(data, routing).await,
         }
     }
-    
+
     /// Send to a single path
     async fn send_single_path(&self, path_idx: usize, data: &[u8]) -> Result<()> {
         // Placeholder - in real implementation, this would use the transport
         tracing::debug!("Sending {} bytes to path {}", data.len(), path_idx);
         Ok(())
     }
-    
+
     /// Split data using FEC for bandwidth aggregation
     async fn send_split(&self, data: &[u8], routing: &RoutingPolicy) -> Result<()> {
         let primary_ratio = match routing {
             RoutingPolicy::Split { primary_ratio } => *primary_ratio,
             _ => 0.7, // Default 70/30 split
         };
-        
+
         let primary_len = (data.len() as f32 * primary_ratio) as usize;
         let primary_chunk = &data[..primary_len.min(data.len())];
         let secondary_chunk = &data[primary_len.min(data.len())..];
-        
+
         // Send primary chunk on primary path
         if !primary_chunk.is_empty() {
-            self.send_single_path(self.primary_idx, primary_chunk).await?;
+            self.send_single_path(self.primary_idx, primary_chunk)
+                .await?;
         }
-        
+
         // Send secondary chunk on best backup path
         if !secondary_chunk.is_empty() {
             if let Some(backup_idx) = self.find_best_backup_path().await {
                 self.send_single_path(backup_idx, secondary_chunk).await?;
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Find best backup path (lowest RTT, highest score)
     async fn find_best_backup_path(&self) -> Option<usize> {
         let mut best_idx = None;
         let mut best_score = 0.0;
-        
+
         for (idx, path) in self.paths.iter().enumerate() {
             if idx == self.primary_idx {
                 continue;
             }
-            
+
             let meta = path.metadata().await;
             if !meta.active {
                 continue;
             }
-            
+
             let score = meta.score();
             if score > best_score {
                 best_score = score;
                 best_idx = Some(idx);
             }
         }
-        
+
         best_idx
     }
-    
+
     /// Receive data from any path
-    pub async fn recv_multipath(
-        &self,
-        buf: &mut [u8],
-    ) -> Result<(usize, usize)> { // (bytes_received, path_index)
+    pub async fn recv_multipath(&self, buf: &mut [u8]) -> Result<(usize, usize)> {
+        // (bytes_received, path_index)
         if self.paths.is_empty() {
             bail!("No active paths");
         }
-        
+
         // Single path optimization
         if self.paths.len() == 1 {
             return self.recv_single_path(0, buf).await.map(|n| (n, 0));
@@ -292,11 +291,9 @@ impl MultipathConnection {
                 continue;
             }
 
-            let recv_result = tokio::time::timeout(
-                Duration::from_secs(30),
-                self.recv_single_path(idx, buf),
-            )
-            .await;
+            let recv_result =
+                tokio::time::timeout(Duration::from_secs(30), self.recv_single_path(idx, buf))
+                    .await;
 
             match recv_result {
                 Ok(Ok(n)) => return Ok((n, idx)),
@@ -313,14 +310,14 @@ impl MultipathConnection {
 
         bail!("Receive timeout on all paths")
     }
-    
+
     /// Receive from single path
     async fn recv_single_path(&self, path_idx: usize, _buf: &mut [u8]) -> Result<usize> {
         // Placeholder - in real implementation, this would use the transport
         tracing::debug!("Receiving from path {}", path_idx);
         Ok(0)
     }
-    
+
     /// Get number of active paths
     pub async fn active_paths(&self) -> usize {
         let mut count = 0;
@@ -332,7 +329,7 @@ impl MultipathConnection {
         }
         count
     }
-    
+
     /// Get primary path index
     pub fn primary_path(&self) -> usize {
         self.primary_idx
@@ -342,13 +339,13 @@ impl MultipathConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_scheduler_policy() {
         let policy = SchedulerPolicy::Redundant;
         assert_eq!(policy, SchedulerPolicy::Redundant);
     }
-    
+
     #[tokio::test]
     async fn test_path_metadata_score() {
         let meta = PathMetadata {
@@ -358,11 +355,11 @@ mod tests {
             active: true,
             created_at: std::time::Instant::now(),
         };
-        
+
         let score = meta.score();
         assert!(score > 0.6); // Low RTT, no loss = high score
     }
-    
+
     #[tokio::test]
     async fn test_multipath_basic() {
         let multi = MultipathConnection::new(SchedulerPolicy::Redundant, 50);

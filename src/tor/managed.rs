@@ -147,7 +147,12 @@ async fn read_line(stream: &mut TcpStream) -> Result<String> {
     Ok(line)
 }
 
-async fn write_torrc(path: &Path, runtime_dir: &Path, control_port: u16, socks_port: u16) -> Result<()> {
+async fn write_torrc(
+    path: &Path,
+    runtime_dir: &Path,
+    control_port: u16,
+    socks_port: u16,
+) -> Result<()> {
     let log_path = runtime_dir.join("tor.log");
     let torrc = format!(
         "DataDirectory \"{}\"\nControlPort {}\nCookieAuthentication 1\nSocksPort 127.0.0.1:{} IsolateDestAddr IsolateDestPort\nAvoidDiskWrites 1\nClientOnly 1\nSafeSocks 1\nLog notice file \"{}\"\n",
@@ -156,7 +161,9 @@ async fn write_torrc(path: &Path, runtime_dir: &Path, control_port: u16, socks_p
         socks_port,
         log_path.display()
     );
-    fs::write(path, torrc).await.context("Failed to write torrc")?;
+    fs::write(path, torrc)
+        .await
+        .context("Failed to write torrc")?;
     Ok(())
 }
 
@@ -184,7 +191,9 @@ async fn create_runtime_dir() -> Result<PathBuf> {
     let base = runtime_base_dir()?;
     let session_id = random_session_id();
     let path = base.join("runtime").join(session_id).join("tor");
-    fs::create_dir_all(&path).await.context("Failed to create runtime dir")?;
+    fs::create_dir_all(&path)
+        .await
+        .context("Failed to create runtime dir")?;
     Ok(path)
 }
 

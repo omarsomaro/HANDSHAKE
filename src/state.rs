@@ -1,21 +1,21 @@
-use serde::{Serialize, Deserialize};
-use std::sync::Arc;
-use tokio::sync::{Mutex, mpsc};
+use crate::security::RateLimiter;
+use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, UdpSocket};
+use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use zeroize::Zeroize;
-use crate::security::RateLimiter;
 
-pub mod metrics;
 pub mod connection_manager;
+pub mod metrics;
 
-pub use metrics::{MetricsCollector, ConnectionMetrics, DebugMetrics, CryptoTimer};
 pub use connection_manager::{
-    ConnectionManager, CircuitState, ConnectionFsmState, 
-    CircuitBreakerStatus, ConnectionCircuitBreaker
+    CircuitBreakerStatus, CircuitState, ConnectionCircuitBreaker, ConnectionFsmState,
+    ConnectionManager,
 };
+pub use metrics::{ConnectionMetrics, CryptoTimer, DebugMetrics, MetricsCollector};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionState {
@@ -156,9 +156,9 @@ impl AppState {
 
     pub async fn clear_crypto_params(&self) {
         let mut inner = self.inner.lock().await;
-        if let Some(mut k) = inner.key_enc.take() { 
-            use zeroize::Zeroize; 
-            k.zeroize(); 
+        if let Some(mut k) = inner.key_enc.take() {
+            use zeroize::Zeroize;
+            k.zeroize();
         }
         inner.tag16 = None;
         inner.tag8 = None;

@@ -1,10 +1,10 @@
-use anyhow::{Result, bail, anyhow};
+use anyhow::{anyhow, bail, Result};
 use hkdf::Hkdf;
-use sha2::Sha256;
-use rand::rngs::OsRng;
-use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use pqcrypto_kyber::kyber768;
 use pqcrypto_traits::kem::{Ciphertext as _, PublicKey as _, SharedSecret as _};
+use rand::rngs::OsRng;
+use sha2::Sha256;
+use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
 pub const X25519_PUBLIC_KEY_BYTES: usize = 32;
 // Noise HFS in snow currently supports Kyber1024 (not Kyber768).
@@ -42,7 +42,13 @@ impl HybridKeyExchange {
         public_key.extend_from_slice(x25519_public.as_bytes());
         public_key.extend_from_slice(kyber_public.as_bytes());
 
-        (Self { x25519_secret, kyber_secret }, public_key)
+        (
+            Self {
+                x25519_secret,
+                kyber_secret,
+            },
+            public_key,
+        )
     }
 
     pub fn encapsulate(&self, peer_public: &[u8]) -> Result<(Vec<u8>, [u8; 32])> {
@@ -58,7 +64,11 @@ impl HybridKeyExchange {
     pub fn decapsulate(&self, peer_public: &[u8], kyber_ct: &[u8]) -> Result<[u8; 32]> {
         let (peer_x25519, _peer_kyber_pk) = parse_peer_public(peer_public)?;
         if kyber_ct.len() != kyber_ciphertext_bytes() {
-            bail!("Kyber ciphertext length mismatch: expected {}, got {}", kyber_ciphertext_bytes(), kyber_ct.len());
+            bail!(
+                "Kyber ciphertext length mismatch: expected {}, got {}",
+                kyber_ciphertext_bytes(),
+                kyber_ct.len()
+            );
         }
 
         let ct = kyber768::Ciphertext::from_bytes(kyber_ct)
@@ -73,7 +83,11 @@ impl HybridKeyExchange {
 fn parse_peer_public(peer_public: &[u8]) -> Result<(X25519PublicKey, kyber768::PublicKey)> {
     let expected = hybrid_public_key_bytes();
     if peer_public.len() != expected {
-        bail!("Hybrid public key length mismatch: expected {}, got {}", expected, peer_public.len());
+        bail!(
+            "Hybrid public key length mismatch: expected {}, got {}",
+            expected,
+            peer_public.len()
+        );
     }
 
     let (x25519_bytes, kyber_bytes) = peer_public.split_at(X25519_PUBLIC_KEY_BYTES);
@@ -119,6 +133,8 @@ mod tests {
         let (alice, _alice_pub) = HybridKeyExchange::generate_keypair();
         let bad_peer = vec![0u8; 10];
         let err = alice.encapsulate(&bad_peer).unwrap_err();
-        assert!(err.to_string().contains("Hybrid public key length mismatch"));
+        assert!(err
+            .to_string()
+            .contains("Hybrid public key length mismatch"));
     }
 }

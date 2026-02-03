@@ -1,12 +1,15 @@
-use hkdf::Hkdf;
-use sha2::{Sha256, Digest};
-use zeroize::Zeroize;
-use argon2::{Argon2, password_hash::{PasswordHasher, Salt}};
+use crate::config::{MAX_PORT, MIN_EPHEMERAL_PORT};
+use argon2::{
+    password_hash::{PasswordHasher, Salt},
+    Argon2,
+};
 use base64::{engine::general_purpose, Engine as _};
-use unicode_normalization::UnicodeNormalization;
-use crate::config::{MIN_EPHEMERAL_PORT, MAX_PORT};
-use secrecy::{ExposeSecret, SecretString};
+use hkdf::Hkdf;
 use rand::RngCore;
+use secrecy::{ExposeSecret, SecretString};
+use sha2::{Digest, Sha256};
+use unicode_normalization::UnicodeNormalization;
+use zeroize::Zeroize;
 
 #[derive(Debug, Clone, Zeroize)]
 #[zeroize(drop)]
@@ -46,7 +49,10 @@ pub fn derive_from_passphrase_v2(passphrase: &str) -> RendezvousParams {
 
 /// V2 Stealth mode: usa ephemeral salt per port randomization
 /// Salva il salt in offer.per_ephemeral_salt per recostruire stessi parametri
-pub fn derive_from_passphrase_v2_stealth(passphrase: &str, salt_override: &[u8; 16]) -> (RendezvousParams, [u8; 16]) {
+pub fn derive_from_passphrase_v2_stealth(
+    passphrase: &str,
+    salt_override: &[u8; 16],
+) -> (RendezvousParams, [u8; 16]) {
     // Se salt_override è fornito, usa quello (per recostruire)
     // Altrimenti, genera random (per creare nuovo)
     let salt_to_use = if salt_override.iter().any(|&b| b != 0) {
@@ -56,13 +62,16 @@ pub fn derive_from_passphrase_v2_stealth(passphrase: &str, salt_override: &[u8; 
         rand::rngs::OsRng.fill_bytes(&mut new_salt);
         new_salt
     };
-    
+
     let params = derive_from_passphrase_v2_with_salt(passphrase, Some(&salt_to_use));
     (params, salt_to_use)
 }
 
 /// Core V2 derivation with optional salt override
-fn derive_from_passphrase_v2_with_salt(passphrase: &str, salt_override: Option<&[u8; 16]>) -> RendezvousParams {
+fn derive_from_passphrase_v2_with_salt(
+    passphrase: &str,
+    salt_override: Option<&[u8; 16]>,
+) -> RendezvousParams {
     // Canonical bytes: NFC + newline canonicalization + no trim
     let mut pass_bytes = canonicalize_passphrase_bytes(passphrase);
 
@@ -72,26 +81,24 @@ fn derive_from_passphrase_v2_with_salt(passphrase: &str, salt_override: Option<&
     } else {
         derive_argon2_salt_v2(&pass_bytes)
     };
-    
+
     let salt_b64 = general_purpose::STANDARD_NO_PAD.encode(&salt_bytes);
     let salt = Salt::from_b64(&salt_b64).expect("valid base64 salt");
-    
+
     // 2. Argon2id con parametri bilanciati
     let argon2 = Argon2::new(
         argon2::Algorithm::Argon2id,
         argon2::Version::V0x13,
-        argon2::Params::new(
-            8192, 3, 1, Some(32),
-        ).expect("valid argon2 params")
+        argon2::Params::new(8192, 3, 1, Some(32)).expect("valid argon2 params"),
     );
-    
+
     // 3. Deriva master key
     let master_key = argon2
         .hash_password(&pass_bytes, salt)
         .expect("argon2 hash")
         .hash
         .expect("hash present");
-    
+
     // 4. HKDF expansion
     let hk = Hkdf::<Sha256>::new(None, master_key.as_bytes());
     let mut port_key = [0u8; 2];
@@ -99,16 +106,21 @@ fn derive_from_passphrase_v2_with_salt(passphrase: &str, salt_override: Option<&
     let mut key_mac = [0u8; 32];
     let mut tag = [0u8; 2];
 
-    hk.expand(b"hs/port/v2", &mut port_key).expect("HKDF expand failed");
-    hk.expand(b"hs/enc/v2", &mut key_enc).expect("HKDF expand failed");
-    hk.expand(b"hs/mac/v2", &mut key_mac).expect("HKDF expand failed");
-    hk.expand(b"hs/tag/v2", &mut tag).expect("HKDF expand failed");
+    hk.expand(b"hs/port/v2", &mut port_key)
+        .expect("HKDF expand failed");
+    hk.expand(b"hs/enc/v2", &mut key_enc)
+        .expect("HKDF expand failed");
+    hk.expand(b"hs/mac/v2", &mut key_mac)
+        .expect("HKDF expand failed");
+    hk.expand(b"hs/tag/v2", &mut tag)
+        .expect("HKDF expand failed");
 
     // 5. Calcola parametri
-    let port = MIN_EPHEMERAL_PORT + (u16::from_be_bytes(port_key) % (MAX_PORT - MIN_EPHEMERAL_PORT));
+    let port =
+        MIN_EPHEMERAL_PORT + (u16::from_be_bytes(port_key) % (MAX_PORT - MIN_EPHEMERAL_PORT));
     let tag16 = u16::from_be_bytes(tag);
     let tag8 = derive_tag8_from_key(&key_enc);
-    
+
     let result = RendezvousParams {
         port,
         key_enc,
@@ -117,13 +129,13 @@ fn derive_from_passphrase_v2_with_salt(passphrase: &str, salt_override: Option<&
         tag8,
         version: 2,
     };
-    
+
     // 6. Zeroize
     use zeroize::Zeroize;
     port_key.zeroize();
     tag.zeroize();
     pass_bytes.zeroize();
-    
+
     result
 }
 
@@ -148,12 +160,17 @@ pub fn derive_from_passphrase_v1(passphrase: &str) -> RendezvousParams {
     let mut key_mac = [0u8; 32];
     let mut tag = [0u8; 2];
 
-    hk.expand(b"hs/port/v1", &mut port_key).expect("HKDF expand failed");
-    hk.expand(b"hs/enc/v1", &mut key_enc).expect("HKDF expand failed");
-    hk.expand(b"hs/mac/v1", &mut key_mac).expect("HKDF expand failed");
-    hk.expand(b"hs/tag/v1", &mut tag).expect("HKDF expand failed");
+    hk.expand(b"hs/port/v1", &mut port_key)
+        .expect("HKDF expand failed");
+    hk.expand(b"hs/enc/v1", &mut key_enc)
+        .expect("HKDF expand failed");
+    hk.expand(b"hs/mac/v1", &mut key_mac)
+        .expect("HKDF expand failed");
+    hk.expand(b"hs/tag/v1", &mut tag)
+        .expect("HKDF expand failed");
 
-    let port = MIN_EPHEMERAL_PORT + (u16::from_be_bytes(port_key) % (MAX_PORT - MIN_EPHEMERAL_PORT));
+    let port =
+        MIN_EPHEMERAL_PORT + (u16::from_be_bytes(port_key) % (MAX_PORT - MIN_EPHEMERAL_PORT));
     let tag16 = u16::from_be_bytes(tag);
     let tag8 = derive_tag8_from_key(&key_enc);
 
@@ -198,7 +215,7 @@ mod tests {
         // Test V2 (Argon2id) determinism
         let params1 = derive_from_passphrase_v2("gattosegreto123");
         let params2 = derive_from_passphrase_v2("gattosegreto123");
-        
+
         assert_eq!(params1.port, params2.port);
         assert_eq!(params1.key_enc, params2.key_enc);
         assert_eq!(params1.key_mac, params2.key_mac);
@@ -211,24 +228,24 @@ mod tests {
         assert_ne!(params1.tag16, params3.tag16);
         assert_ne!(params1.tag8, params3.tag8);
     }
-    
+
     #[test]
     fn test_determinism_v1_compatibility() {
-        // Test V1 (SHA256) still works 
+        // Test V1 (SHA256) still works
         let params1 = derive_from_passphrase_v1("gattosegreto123");
         let params2 = derive_from_passphrase_v1("gattosegreto123");
-        
+
         assert_eq!(params1.port, params2.port);
         assert_eq!(params1.key_enc, params2.key_enc);
         assert_eq!(params1.version, 1);
     }
-    
+
     #[test]
     fn test_v1_v2_different() {
         // V1 e V2 devono produrre parametri diversi (diversi domini)
         let params_v1 = derive_from_passphrase_v1("test123");
         let params_v2 = derive_from_passphrase_v2("test123");
-        
+
         assert_ne!(params_v1.port, params_v2.port);
         assert_ne!(params_v1.key_enc, params_v2.key_enc);
         assert_ne!(params_v1.tag16, params_v2.tag16);

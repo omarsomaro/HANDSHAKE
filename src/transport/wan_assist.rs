@@ -101,9 +101,9 @@ async fn coordinate_with_relay(
     let my_udp_candidates = gather_udp_candidates(params.port).await?;
     let ttl_ms = cfg.wan_connect_timeout_ms.min(10000) as u16;
     let (control, request_id) = if cfg.assist_obfuscation_v5 {
-        let obf_key = derive_obfuscation_key_v5(&params.key_enc, params.tag16);
+        let obf_key = derive_obfuscation_key_v5(&params.key_enc, params.tag16)?;
         let blinded =
-            make_blinded_candidates_v5_shuffled(&my_udp_candidates, &obf_key, &request_id);
+            make_blinded_candidates_v5_shuffled(&my_udp_candidates, &obf_key, &request_id)?;
         let mut request = AssistRequestV5 {
             request_id,
             blinded_candidates: blinded,
@@ -112,7 +112,7 @@ async fn coordinate_with_relay(
             dandelion_tag: None,   // Default: relay generates tag
             mac: [0u8; 32],
         };
-        request.mac = compute_assist_mac_v5(&params.key_enc, &request);
+        request.mac = compute_assist_mac_v5(&params.key_enc, &request)?;
         (Control::AssistRequestV5(request), request_id)
     } else {
         let mut request = AssistRequest {
@@ -122,13 +122,13 @@ async fn coordinate_with_relay(
             ttl_ms,
             mac: [0u8; 32],
         };
-        request.mac = compute_assist_mac(&params.key_enc, &request);
+        request.mac = compute_assist_mac(&params.key_enc, &request)?;
         (Control::AssistRequest(request), request_id)
     };
 
     // 2. Invia richiesta a C (framed TCP)
     let payload = bincode::serialize(&control)?;
-    let mut nonce_seq = NonceSeq::new_boot_random(&params.key_enc, NONCE_DOMAIN_ASSIST, 0x01);
+    let mut nonce_seq = NonceSeq::new_boot_random(&params.key_enc, NONCE_DOMAIN_ASSIST, 0x01)?;
     let (nonce, seq) = nonce_seq.next_nonce_and_seq()?;
     let clear = ClearPayload {
         ts_ms: now_ms(),
@@ -148,7 +148,7 @@ async fn coordinate_with_relay(
             .context("Failed to read AssistGo frame")?;
         let pkt = deserialize_cipher_packet_with_limit(&frame, MAX_TCP_FRAME_BYTES)?;
         let clear = open(&params.key_enc, &pkt, params.tag16, params.tag8)
-            .ok_or_else(|| anyhow!("Invalid AssistGo MAC"))?;
+            .ok_or_else(|| anyhow!("Invalid AssistGo packet"))?;
         let ctrl: Control = bincode::deserialize(&clear.data)?;
         match (cfg.assist_obfuscation_v5, ctrl) {
             (true, Control::AssistGoV5(go)) if go.request_id == request_id => {
@@ -172,9 +172,9 @@ async fn coordinate_with_relay(
         AssistGoOrV5::V4(go) => udp_burst_punch(&go, params.tag16).await,
         AssistGoOrV5::V5(go) => {
             if !verify_assist_go_mac_v5(&params.key_enc, &go) {
-                bail!("Invalid AssistGoV5 MAC");
+                bail!("Invalid AssistGoV5 packet");
             }
-            let obf_key = derive_obfuscation_key_v5(&params.key_enc, params.tag16);
+            let obf_key = derive_obfuscation_key_v5(&params.key_enc, params.tag16)?;
             let candidates = unblind_candidates_v5(&go, &obf_key, cfg.assist_candidate_policy);
             let go_v4 = AssistGo {
                 request_id: go.request_id,
@@ -212,7 +212,13 @@ fn unblind_candidates_v5(
 ) -> Vec<SocketAddr> {
     let mut out = Vec::new();
     for (idx, cand) in go.peer_candidates.iter().enumerate() {
-        let nonce = derive_entry_nonce_v5_improved(&go.request_id, idx, obf_key);
+        let nonce = match derive_entry_nonce_v5_improved(&go.request_id, idx, obf_key) {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!("Assist V5 nonce derivation failed: {}", e);
+                continue;
+            }
+        };
         if let Some(addr) = cand.unblind(obf_key, &nonce) {
             if is_usable_candidate(&addr, policy) {
                 out.push(addr);
@@ -482,7 +488,7 @@ pub mod coordination {
             key_enc: my_offer.rendezvous.key_enc,
             key_mac: [0u8; 32],
             tag16: my_offer.rendezvous.tag16,
-            tag8: crate::derive::derive_tag8_from_key(&my_offer.rendezvous.key_enc),
+            tag8: crate::derive::derive_tag8_from_key(&my_offer.rendezvous.key_enc)?,
             version: my_offer.ver,
         };
 
@@ -519,22 +525,40 @@ pub mod coordination {
     }
 
     /// Wrapper che prova simultaneo, fallback a sequenziale
+    ///
+    /// NOTE: Simultaneous Open requires assist relays to be configured.
     pub async fn try_simultaneous_or_sequential(
         my_offer: &OfferPayload,
         their_hash: [u8; 32],
         relay_onions: &[String],
         cfg: &Config,
     ) -> Result<crate::transport::Connection> {
-        // Prova simultaneo sul primo relay
-        if !relay_onions.is_empty() {
+        if relay_onions.is_empty() {
+            tracing::info!("Simultaneous open skipped: no assist relays configured");
+            return Err(anyhow!(
+                "Simultaneous open requires assist relays configured"
+            ));
+        }
+
+        // Prova simultaneo sul primo relay (con retry + backoff)
+        let max_attempts: u8 = 3;
+        let mut attempt: u8 = 0;
+        while attempt < max_attempts {
             match coordinate_simultaneous_open(my_offer, their_hash, &relay_onions[0], cfg).await {
                 Ok(conn) => return Ok(conn),
                 Err(e) => {
                     tracing::warn!(
-                        "Simultaneous open failed: {}, trying sequential relay attempts",
+                        "Simultaneous open failed (attempt {}/{}): {}",
+                        attempt + 1,
+                        max_attempts,
                         e
                     );
                 }
+            }
+            attempt += 1;
+            if attempt < max_attempts {
+                let backoff_ms = 500u64.saturating_mul(1u64 << attempt);
+                sleep(Duration::from_millis(backoff_ms)).await;
             }
         }
 
@@ -544,7 +568,7 @@ pub mod coordination {
             key_enc: my_offer.rendezvous.key_enc,
             key_mac: [0u8; 32],
             tag16: my_offer.rendezvous.tag16,
-            tag8: crate::derive::derive_tag8_from_key(&my_offer.rendezvous.key_enc),
+            tag8: crate::derive::derive_tag8_from_key(&my_offer.rendezvous.key_enc)?,
             version: my_offer.ver,
         };
 

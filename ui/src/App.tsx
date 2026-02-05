@@ -17,13 +17,14 @@ const TOR_ROLES = ["client", "host"] as const;
 const GUARANTEED_EGRESS = ["public", "tor"] as const;
 const PLUGGABLE_TRANSPORTS = ["none", "https", "ftp", "dns", "websocket", "quic"] as const;
 const STEALTH_MODES = ["active", "passive", "mdns"] as const;
-const FLOW_MODES = ["classic", "offer", "target", "phrase", "guaranteed"] as const;
+const FLOW_MODES = ["classic", "offer", "hybrid", "target", "phrase", "guaranteed"] as const;
 
 type FlowMode = (typeof FLOW_MODES)[number];
 
 const FLOW_LABELS: Record<FlowMode, string> = {
   classic: "Classic cascade",
   offer: "Offer QR",
+  hybrid: "Hybrid QR (resume)",
   target: "Target direct",
   phrase: "Easy Tor (Phrase)",
   guaranteed: "Guaranteed relay"
@@ -32,6 +33,7 @@ const FLOW_LABELS: Record<FlowMode, string> = {
 const FLOW_DESC: Record<FlowMode, string> = {
   classic: "LAN -> WAN -> Assist -> Tor fallback with full automation.",
   offer: "QR offer handshake for quick pairing without typing addresses.",
+  hybrid: "QR with resume token + deterministic fallback (best UX for re-join).",
   target: "Direct connect to an IP:port or .onion target you already know.",
   phrase: "Tor-friendly invite flow with a private passphrase.",
   guaranteed: "Always-on relay with optional Tor egress."
@@ -40,6 +42,12 @@ const FLOW_DESC: Record<FlowMode, string> = {
 const FLOW_STEPS: Record<FlowMode, string[]> = {
   classic: ["Start daemon", "Set passphrase", "Pick WAN + Tor role", "Connect cascade"],
   offer: ["Start daemon", "Set passphrase", "Generate offer QR", "Client connects with offer"],
+  hybrid: [
+    "Start daemon",
+    "Set passphrase",
+    "Generate Hybrid QR",
+    "Client connects with QR (resume + fallback)"
+  ],
   target: ["Start daemon", "Set passphrase", "Enter target", "Connect direct"],
   phrase: ["Start daemon", "Host opens phrase", "Share invite", "Client joins"],
   guaranteed: ["Start daemon", "Enter passphrase", "Pick egress", "Connect relay"]
@@ -71,6 +79,7 @@ interface StatusResponse {
   port?: number | null;
   mode: string;
   peer?: string | null;
+  resume_status?: string | null;
 }
 
 interface OfferResponse {
@@ -78,6 +87,43 @@ interface OfferResponse {
   ver: number;
   expires_at_ms: number;
   endpoints: string[];
+}
+
+interface HybridQrResponse {
+  qr: string;
+  offer: string;
+  ver: number;
+  expires_at_ms: number;
+  resume_expires_at_ms: number;
+  endpoints: string[];
+  relay_hints: string[];
+}
+
+interface PluggableCheckResponse {
+  pluggable_transport: {
+    enabled: boolean;
+    status: string;
+    checklist: {
+      real_tls: string;
+      websocket: string;
+      http2: string;
+      quic: string;
+    };
+  };
+}
+
+interface DebugMetricsResponse {
+  connection: {
+    transport_mode: string;
+    nat_type?: string | null;
+    packet_loss_rate: number;
+    avg_encrypt_us: number;
+    avg_decrypt_us: number;
+    connection_errors: number;
+  };
+  throughput_mbps: number;
+  health_score: number;
+  status: string;
 }
 
 async function readTokenFile(path: string): Promise<string> {
@@ -107,6 +153,15 @@ export default function App() {
   const [offerTtl, setOfferTtl] = useState<string>("");
   const [offerRoleHint, setOfferRoleHint] = useState<"host" | "client">("host");
   const [offerLocalRole, setOfferLocalRole] = useState<"host" | "client">("client");
+  const [hybridQrResult, setHybridQrResult] = useState<HybridQrResponse | null>(null);
+  const [hybridQrImage, setHybridQrImage] = useState<string | null>(null);
+  const [hybridQrTtl, setHybridQrTtl] = useState<string>("");
+  const [hybridResumeTtl, setHybridResumeTtl] = useState<string>("");
+  const [hybridRoleHint, setHybridRoleHint] = useState<"host" | "client">("host");
+  const [hybridLocalRole, setHybridLocalRole] = useState<"host" | "client">("client");
+  const [hybridIncludeTor, setHybridIncludeTor] = useState<boolean>(false);
+  const [hybridRelayHints, setHybridRelayHints] = useState<string>("");
+  const [hybridQrInput, setHybridQrInput] = useState<string>("");
   const [phraseInvite, setPhraseInvite] = useState<string>("");
   const [phraseQr, setPhraseQr] = useState<string | null>(null);
   const [phraseStatus, setPhraseStatus] = useState<string>("closed");
@@ -135,6 +190,8 @@ export default function App() {
   const [warning, setWarning] = useState<string | null>(null);
   const [sseEnabled, setSseEnabled] = useState(false);
   const [connectAttempted, setConnectAttempted] = useState(false);
+  const [pluggableCheck, setPluggableCheck] = useState<PluggableCheckResponse | null>(null);
+  const [metrics, setMetrics] = useState<DebugMetricsResponse | null>(null);
 
   const statusTimer = useRef<number | null>(null);
   const lastDaemonError = useRef<string | null>(null);
@@ -144,6 +201,38 @@ export default function App() {
     () => (token ? { Authorization: `Bearer ${token}` } : {}),
     [token]
   );
+
+  const formatTtl = useCallback((expiresAtMs?: number | null) => {
+    if (!expiresAtMs) return "-";
+    const delta = Math.max(0, expiresAtMs - Date.now());
+    const s = Math.floor(delta / 1000);
+    const m = Math.floor(s / 60);
+    const h = Math.floor(m / 60);
+    if (h > 0) return `${h}h ${m % 60}m`;
+    if (m > 0) return `${m}m ${s % 60}s`;
+    return `${s}s`;
+  }, []);
+
+  const isSymmetricNat = useMemo(() => {
+    const nat = metrics?.connection?.nat_type?.toLowerCase() ?? "";
+    return nat.includes("symmetric");
+  }, [metrics]);
+
+  const modeBadge = useMemo(() => {
+    const mode = connectStatus?.mode ?? "unknown";
+    if (mode === "lan" || mode === "wan" || mode === "stun") return { label: mode, tone: "ok" };
+    if (mode === "wan_tcp") return { label: "wan_tcp (udp blocked)", tone: "warn" };
+    if (mode === "wan_tor") return { label: "wan_tor (relay)", tone: "warn" };
+    if (mode === "quic" || mode === "webrtc") return { label: mode, tone: "info" };
+    return { label: mode, tone: "muted" };
+  }, [connectStatus]);
+
+  const healthBadge = useMemo(() => {
+    if (!metrics) return { label: "unknown", tone: "muted" };
+    if (metrics.health_score >= 80) return { label: "healthy", tone: "ok" };
+    if (metrics.health_score >= 50) return { label: "degraded", tone: "warn" };
+    return { label: "poor", tone: "danger" };
+  }, [metrics]);
 
   const refreshAuth = useCallback(async () => {
     if (!tokenFile) throw new Error("token file not set");
@@ -274,6 +363,26 @@ export default function App() {
       logLine("DAEMON", `log fetch failed: ${(err as Error).message}`);
     }
   }, [logLine]);
+
+  const handleRefreshPluggable = useCallback(async () => {
+    try {
+      const res = await fetchWithAuth("/v1/pluggable/check");
+      const data = (await res.json()) as PluggableCheckResponse;
+      setPluggableCheck(data);
+    } catch (err) {
+      logLine("PLUGGABLE", (err as Error).message);
+    }
+  }, [fetchWithAuth, logLine]);
+
+  const handleRefreshMetrics = useCallback(async () => {
+    try {
+      const res = await fetchWithAuth("/v1/metrics");
+      const data = (await res.json()) as DebugMetricsResponse;
+      setMetrics(data);
+    } catch (err) {
+      logLine("METRICS", (err as Error).message);
+    }
+  }, [fetchWithAuth, logLine]);
 
   const handleStopDaemon = useCallback(async () => {
     await invoke("stop_daemon");
@@ -542,6 +651,60 @@ export default function App() {
       logLine("OFFER", (err as Error).message);
     }
   }, [fetchWithAuth, passphrase, includeTorOffer, offerRoleHint, offerTtl]);
+
+  const handleHybridQr = useCallback(async () => {
+    if (!passphrase) return;
+    try {
+      const res = await fetchWithAuth("/v1/qr/hybrid", {
+        method: "POST",
+        body: JSON.stringify({
+          passphrase,
+          include_tor: hybridIncludeTor,
+          role_hint: hybridRoleHint,
+          ttl_s: hybridQrTtl ? Number(hybridQrTtl) : undefined,
+          resume_ttl_s: hybridResumeTtl ? Number(hybridResumeTtl) : undefined,
+          relay_hints: hybridRelayHints
+            ? hybridRelayHints.split(",").map((s) => s.trim()).filter(Boolean)
+            : undefined
+        })
+      });
+      const data = (await res.json()) as HybridQrResponse;
+      setHybridQrResult(data);
+      setHybridQrImage(await QRCode.toDataURL(data.qr, { width: 280, margin: 1 }));
+      logLine("QR", `hybrid ver=${data.ver}`);
+    } catch (err) {
+      logLine("QR", (err as Error).message);
+    }
+  }, [
+    fetchWithAuth,
+    passphrase,
+    hybridIncludeTor,
+    hybridRoleHint,
+    hybridQrTtl,
+    hybridResumeTtl,
+    hybridRelayHints,
+    logLine
+  ]);
+
+  const handleConnectHybridQr = useCallback(async () => {
+    const qrTrim = hybridQrInput.trim();
+    if (!qrTrim) return;
+    try {
+      const res = await fetchWithAuth("/v1/connect", {
+        method: "POST",
+        body: JSON.stringify({
+          qr: qrTrim,
+          local_role: hybridLocalRole
+        })
+      });
+      const data = (await res.json()) as StatusResponse;
+      setConnectStatus(data);
+      setConnectAttempted(true);
+      logLine("CONNECT", `${data.status} mode=${data.mode}`);
+    } catch (err) {
+      logLine("CONNECT", (err as Error).message);
+    }
+  }, [fetchWithAuth, hybridQrInput, hybridLocalRole, logLine]);
 
   useEffect(() => {
     invoke("daemon_status").then((r) => setDaemonStatus(r as DaemonStatus));
@@ -949,6 +1112,10 @@ export default function App() {
         {flowMode === "offer" && (
           <div className="panel">
             <h2>Offer QR</h2>
+            <div className="helper-text">
+              The QR is a rendezvous envelope (endpoints + timing). It does NOT contain your
+              passphrase. Use it for fast pairing without typing addresses.
+            </div>
             <div className="checklist">
               <div className={`check-item ${apiReady ? "done" : ""}`}>
                 {mark(apiReady)} Daemon running + token loaded
@@ -999,12 +1166,23 @@ export default function App() {
               {offerQr && <img src={offerQr} alt="offer qr" />}
               {offerResult && <textarea rows={4} value={offerResult.offer} readOnly />}
               {offerResult && (
-                <button
-                  className="secondary"
-                  onClick={() => navigator.clipboard.writeText(offerResult.offer)}
-                >
-                  Copy
-                </button>
+                <div className="helper-text">
+                  Expires in {formatTtl(offerResult.expires_at_ms)}. Endpoints:{" "}
+                  {offerResult.endpoints.join(", ")}
+                </div>
+              )}
+              {offerResult && (
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button
+                    className="secondary"
+                    onClick={() => navigator.clipboard.writeText(offerResult.offer)}
+                  >
+                    Copy
+                  </button>
+                  <button className="secondary" onClick={handleOffer}>
+                    Regenerate
+                  </button>
+                </div>
               )}
             </div>
             <div style={{ marginTop: 12 }}>
@@ -1039,9 +1217,142 @@ export default function App() {
           </div>
         )}
 
+        {flowMode === "hybrid" && (
+          <div className="panel">
+            <h2>Hybrid QR (Resume + Fallback)</h2>
+            <div className="helper-text">
+              Hybrid QR adds a resume token for fast re-join while keeping the deterministic
+              fallback offer inside. This is the most robust QR flow.
+            </div>
+            <div className="checklist">
+              <div className={`check-item ${apiReady ? "done" : ""}`}>
+                {mark(apiReady)} Daemon running + token loaded
+              </div>
+              <div className={`check-item ${passphrase.trim() ? "done" : ""}`}>
+                {mark(passphrase.trim().length > 0)} Passphrase set
+              </div>
+              <div className={`check-item ${hybridQrResult ? "done" : ""}`}>
+                {mark(Boolean(hybridQrResult))} Hybrid QR generated
+              </div>
+            </div>
+            <ol className="flow-steps">
+              <li>Host generates Hybrid QR</li>
+              <li>Client scans QR</li>
+              <li>Client connects (resume if possible, fallback otherwise)</li>
+            </ol>
+            <div className="field-block">
+              <div className="field-label">Role hint (host)</div>
+              <div className="mode-row">
+                {["host", "client"].map((r) => (
+                  <div
+                    key={r}
+                    className={`mode-pill ${hybridRoleHint === r ? "active" : ""}`}
+                    onClick={() => setHybridRoleHint(r as "host" | "client")}
+                  >
+                    {r}
+                  </div>
+                ))}
+              </div>
+            </div>
+            <label style={{ display: "block", marginBottom: 6 }}>
+              <input
+                type="checkbox"
+                checked={hybridIncludeTor}
+                onChange={(e) => setHybridIncludeTor(e.target.checked)}
+              />
+              &nbsp;Include Tor endpoint
+            </label>
+            <div className="field-block">
+              <div className="field-label">QR TTL (seconds)</div>
+              <input
+                placeholder="QR TTL seconds (optional)"
+                value={hybridQrTtl}
+                onChange={(e) => setHybridQrTtl(e.target.value)}
+              />
+            </div>
+            <div className="field-block">
+              <div className="field-label">Resume TTL (seconds)</div>
+              <input
+                placeholder="Resume TTL seconds (optional)"
+                value={hybridResumeTtl}
+                onChange={(e) => setHybridResumeTtl(e.target.value)}
+              />
+            </div>
+            <textarea
+              rows={2}
+              placeholder="Relay hints (comma-separated)"
+              value={hybridRelayHints}
+              onChange={(e) => setHybridRelayHints(e.target.value)}
+            />
+            <div className="qr-box" style={{ marginTop: 12 }}>
+              <button onClick={handleHybridQr} disabled={!apiReady || !passphrase.trim()}>
+                Generate hybrid QR
+              </button>
+              {hybridQrImage && <img src={hybridQrImage} alt="hybrid qr" />}
+              {hybridQrResult && <textarea rows={4} value={hybridQrResult.qr} readOnly />}
+              {hybridQrResult && (
+                <div className="helper-text">
+                  QR expires in {formatTtl(hybridQrResult.expires_at_ms)}. Resume expires in{" "}
+                  {formatTtl(hybridQrResult.resume_expires_at_ms)}. Endpoints:{" "}
+                  {hybridQrResult.endpoints.join(", ")}
+                </div>
+              )}
+              {hybridQrResult && (
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button
+                    className="secondary"
+                    onClick={() => navigator.clipboard.writeText(hybridQrResult.qr)}
+                  >
+                    Copy QR
+                  </button>
+                  <button className="secondary" onClick={handleHybridQr}>
+                    Regenerate
+                  </button>
+                </div>
+              )}
+            </div>
+            <div style={{ marginTop: 12 }}>
+              <input
+                placeholder="paste hybrid QR"
+                value={hybridQrInput}
+                onChange={(e) => setHybridQrInput(e.target.value)}
+              />
+              <div className="field-block">
+                <div className="field-label">Local role (client)</div>
+                <div className="mode-row">
+                  {["host", "client"].map((r) => (
+                    <div
+                      key={r}
+                      className={`mode-pill ${hybridLocalRole === r ? "active" : ""}`}
+                      onClick={() => setHybridLocalRole(r as "host" | "client")}
+                    >
+                      {r}
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                <button className="secondary" onClick={() => setHybridQrInput("")}>
+                  Clear QR
+                </button>
+                <button
+                  onClick={handleConnectHybridQr}
+                  disabled={!apiReady || !hybridQrInput.trim()}
+                >
+                  Connect via QR
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
         {flowMode === "target" && (
           <div className="panel">
             <h2>Target Direct</h2>
+            <div className="helper-text">
+              Direct target is fragile behind NAT/firewall. If this fails, prefer Offer/Hybrid QR
+              with Tor relay.
+            </div>
             <div className="checklist">
               <div className={`check-item ${apiReady ? "done" : ""}`}>
                 {mark(apiReady)} Daemon running + token loaded
@@ -1088,6 +1399,10 @@ export default function App() {
         {flowMode === "phrase" && (
           <div className="panel">
             <h2>Easy Tor (Phrase)</h2>
+            <div className="helper-text">
+              The QR invite does NOT include the passphrase. Share the QR and send the passphrase
+              privately.
+            </div>
             <div className="checklist">
               <div className={`check-item ${apiReady ? "done" : ""}`}>
                 {mark(apiReady)} Daemon running + token loaded
@@ -1215,16 +1530,30 @@ export default function App() {
               <div>
                 status: {connectStatus.status}
                 <br />
-                mode: {connectStatus.mode}
+                mode: {connectStatus.mode}{" "}
+                <span className={`badge badge-${modeBadge.tone}`}>{modeBadge.label}</span>
                 <br />
                 port: {connectStatus.port ?? "-"}
                 <br />
                 peer: {connectStatus.peer ?? "-"}
+                <br />
+                resume: {connectStatus.resume_status ?? "-"}
               </div>
             ) : (
               "No status"
             )}
           </div>
+          {connectStatus?.mode === "wan_tcp" && (
+            <div className="warning-text" style={{ marginTop: 8 }}>
+              UDP blocked detected. TCP fallback active. For reliability, prefer Offer/Hybrid QR
+              with Tor relay.
+            </div>
+          )}
+          {connectStatus?.mode === "wan_tor" && (
+            <div className="helper-text" style={{ marginTop: 8 }}>
+              Tor/relay transport active. Stable but higher latency.
+            </div>
+          )}
           <div style={{ marginTop: 10, fontSize: 12 }}>
             daemon error: {daemonStatus.last_error ?? "-"}
             <br />
@@ -1239,6 +1568,79 @@ export default function App() {
             </button>
             <button className="secondary" onClick={() => setSseEnabled(false)} disabled={!apiReady}>
               Stop SSE
+            </button>
+          </div>
+        </div>
+
+        <div className="panel">
+          <h2>Network Diagnostics</h2>
+          <div className="helper-text">
+            This panel reflects live, RAM-only diagnostics. No data is persisted.
+          </div>
+          <div style={{ fontSize: 13, marginTop: 8 }}>
+            {metrics ? (
+              <div>
+                health: {metrics.status} ({metrics.health_score}){" "}
+                <span className={`badge badge-${healthBadge.tone}`}>{healthBadge.label}</span>
+                <br />
+                nat_type: {metrics.connection.nat_type ?? "-"}
+                <br />
+                transport: {metrics.connection.transport_mode}
+                <br />
+                throughput: {metrics.throughput_mbps.toFixed(3)} MB/s
+                <br />
+                packet_loss: {metrics.connection.packet_loss_rate.toFixed(2)}%
+                <br />
+                encrypt_avg: {metrics.connection.avg_encrypt_us.toFixed(1)} µs
+                <br />
+                decrypt_avg: {metrics.connection.avg_decrypt_us.toFixed(1)} µs
+                <br />
+                connection_errors: {metrics.connection.connection_errors}
+              </div>
+            ) : (
+              "No diagnostics"
+            )}
+          </div>
+          {isSymmetricNat && (
+            <div className="warning-text" style={{ marginTop: 8 }}>
+              Symmetric NAT detected. Direct paths are unreliable. Prefer Offer/Hybrid QR with Tor
+              relay.
+            </div>
+          )}
+          <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+            <button className="secondary" onClick={handleRefreshMetrics} disabled={!apiReady}>
+              Refresh diagnostics
+            </button>
+          </div>
+        </div>
+
+        <div className="panel">
+          <h2>Pluggable Transports</h2>
+          <div className="helper-text">
+            Pluggables require external infrastructure. HTTP/2 and QUIC are mimicry-only.
+          </div>
+          <div style={{ fontSize: 13, marginTop: 8 }}>
+            {pluggableCheck ? (
+              <div>
+                enabled: {String(pluggableCheck.pluggable_transport.enabled)}
+                <br />
+                status: {pluggableCheck.pluggable_transport.status}
+                <br />
+                real_tls: {pluggableCheck.pluggable_transport.checklist.real_tls}
+                <br />
+                websocket: {pluggableCheck.pluggable_transport.checklist.websocket}
+                <br />
+                http2: {pluggableCheck.pluggable_transport.checklist.http2}
+                <br />
+                quic: {pluggableCheck.pluggable_transport.checklist.quic}
+              </div>
+            ) : (
+              "No pluggable status"
+            )}
+          </div>
+          <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+            <button className="secondary" onClick={handleRefreshPluggable} disabled={!apiReady}>
+              Refresh pluggables
             </button>
           </div>
         </div>

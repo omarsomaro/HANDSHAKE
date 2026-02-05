@@ -12,6 +12,19 @@ pub enum Control {
     NoiseHandshake(Vec<u8>),
     /// Session key exchange (Noise channel post-handshake)
     SessionKey([u8; 32]),
+    /// Session key ack (best-effort)
+    SessionKeyAck(u64),
+    /// Resume handshake hello (pre-Noise, base-key protected)
+    ResumeHello {
+        token_id: u64,
+        client_nonce: [u8; 32],
+        ts_ms: u64,
+    },
+    /// Resume handshake accept (pre-Noise, base-key protected)
+    ResumeAccept {
+        token_id: u64,
+        server_nonce: [u8; 32],
+    },
     /// Application data (after session key established)
     App(Vec<u8>),
     /// Assist request (A -> C)

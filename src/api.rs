@@ -37,11 +37,12 @@ use crate::{
     },
     crypto::{
         deserialize_cipher_packet_with_limit, now_ms, now_us, open, seal, serialize_cipher_packet,
-        CipherPacket, ClearPayload, MAX_TCP_FRAME_BYTES, MAX_UDP_PACKET_BYTES,
+        CipherPacket, ClearPayload, SessionKeyState, MAX_TCP_FRAME_BYTES, MAX_UDP_PACKET_BYTES,
     },
     derive::{derive_from_secret, derive_tag8_from_key},
     offer::{OfferPayload, RoleHint},
     protocol::Control,
+    resume::HybridQrPayload,
     security::{RateLimiter, TimeValidator},
     state::{AppState, CryptoTimer, DebugMetrics},
     transport::{self, Connection},
@@ -89,6 +90,7 @@ impl IntoResponse for ApiError {
 pub struct ConnectionRequest {
     pub passphrase: Option<String>,
     pub offer: Option<String>,
+    pub qr: Option<String>,
     pub local_role: Option<RoleHint>,
     pub target: Option<String>,
     #[serde(default)]
@@ -110,6 +112,7 @@ pub struct ConnectionResponse {
     pub port: Option<u16>,
     pub mode: String,
     pub peer: Option<String>,
+    pub resume_status: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -316,7 +319,51 @@ pub async fn create_api_server(
 
     async fn handle_pluggable_protocols() -> impl axum::response::IntoResponse {
         axum::Json(serde_json::json!({
-            "protocols": ["websocket", "quic", "http2", "none"]
+            "protocols": ["none", "httpslike", "ftpdata", "dnstunnel", "websocket", "quic", "realtls"],
+            "status": "experimental",
+            "requires_external_infra": true,
+            "warning": "Pluggable transports are experimental. RealTls/WebSocket require external server-side infrastructure. HTTP/2 and QUIC are mimicry-only (not full protocol implementations). If you are not operating that infrastructure, connections may fail or be fingerprintable."
+        }))
+    }
+
+    async fn handle_pluggable_check() -> impl axum::response::IntoResponse {
+        let cfg = Config::from_env();
+        let enabled = cfg.pluggable_transport != crate::config::PluggableTransportMode::None;
+
+        let status = if enabled {
+            "requires_external_infrastructure"
+        } else {
+            "disabled"
+        };
+
+        let real_tls_status = match &cfg.pluggable_transport {
+            crate::config::PluggableTransportMode::RealTls(domain) if !domain.trim().is_empty() => {
+                "CONFIGURED"
+            }
+            _ => "NOT_CONFIGURED",
+        };
+
+        let websocket_status = match cfg.pluggable_transport {
+            crate::config::PluggableTransportMode::WebSocket => "REQUIRES_EXTERNAL_INFRA",
+            _ => "NOT_CONFIGURED",
+        };
+
+        let quic_status = match cfg.pluggable_transport {
+            crate::config::PluggableTransportMode::Quic => "MIMICRY_ONLY",
+            _ => "NOT_CONFIGURED",
+        };
+
+        axum::Json(serde_json::json!({
+            "pluggable_transport": {
+                "enabled": enabled,
+                "status": status,
+                "checklist": {
+                    "real_tls": real_tls_status,
+                    "websocket": websocket_status,
+                    "http2": "EXPERIMENTAL_MIMICRY",
+                    "quic": quic_status
+                }
+            }
         }))
     }
 
@@ -335,9 +382,14 @@ pub async fn create_api_server(
         .route("/v1/disconnect", post(handle_disconnect))
         .route("/v1/metrics", get(handle_metrics))
         .route("/v1/pluggable/protocols", get(handle_pluggable_protocols))
+        .route("/v1/pluggable/check", get(handle_pluggable_check))
         .route("/v1/rendezvous/sync", post(handle_simultaneous_open_sync))
         .route("/v1/circuit", get(handle_circuit_status))
         .route("/v1/offer", post(crate::api_offer::handle_offer_generate))
+        .route(
+            "/v1/qr/hybrid",
+            post(crate::api_offer::handle_hybrid_qr_generate),
+        )
         .route("/v1/phrase/open", post(handle_phrase_open))
         .route("/v1/phrase/close", post(handle_phrase_close))
         .route("/v1/phrase/join", post(handle_phrase_join))
@@ -402,10 +454,22 @@ async fn handle_connect(
             "provide either passphrase or offer, not both",
         ));
     }
+    if req.qr.is_some() && (req.offer.is_some() || req.passphrase.is_some()) {
+        return Err(connect_err(
+            StatusCode::BAD_REQUEST,
+            "provide either qr or passphrase/offer, not both",
+        ));
+    }
     if req.offer.is_some() && req.target.is_some() {
         return Err(connect_err(
             StatusCode::BAD_REQUEST,
             "target not allowed with offer",
+        ));
+    }
+    if req.qr.is_some() && req.target.is_some() {
+        return Err(connect_err(
+            StatusCode::BAD_REQUEST,
+            "target not allowed with qr",
         ));
     }
     if req.target.is_some() && req.passphrase.is_none() {
@@ -466,6 +530,12 @@ async fn handle_connect(
                 "offer/target not allowed in guaranteed mode",
             ));
         }
+        if req.qr.is_some() {
+            return Err(connect_err(
+                StatusCode::BAD_REQUEST,
+                "qr not allowed in guaranteed mode",
+            ));
+        }
         let passphrase = match req.passphrase {
             Some(p) => SecretString::from(p),
             None => return Err(connect_err(StatusCode::BAD_REQUEST, "passphrase required")),
@@ -477,7 +547,10 @@ async fn handle_connect(
             }
         }
 
-        let params = derive_from_secret(&passphrase);
+        let params = derive_from_secret(&passphrase).map_err(|e| {
+            tracing::error!("Derivation failed: {:?}", e);
+            connect_err(StatusCode::INTERNAL_SERVER_ERROR, "operation failed")
+        })?;
         let io = match crate::transport::guaranteed::establish_connection_guaranteed(
             &params,
             &cfg,
@@ -535,7 +608,13 @@ async fn handle_connect(
             }
         };
 
-        let session_cipher_params = (session_key, params.tag16, params.tag8);
+        let session_cipher = Arc::new(tokio::sync::RwLock::new(SessionKeyState::new(
+            session_key,
+            params.tag16,
+            params.tag8,
+            cfg.key_rotation_grace_ms(),
+        )));
+        let rotation_policy = cfg.key_rotation_policy();
         tracing::info!("Guaranteed noise upgrade completed");
 
         let (tx_out, rx_out) = mpsc::channel(DEFAULT_CHANNEL_CAPACITY);
@@ -561,7 +640,7 @@ async fn handle_connect(
         let _rx_handle = crate::transport::tasks::spawn_receiver_task_with_stop_io(
             io.clone(),
             updated_streams.clone(),
-            session_cipher_params,
+            session_cipher.clone(),
             rl,
             stop_rx1,
         )
@@ -574,7 +653,8 @@ async fn handle_connect(
             rx_out,
             stop_rx2,
             metrics,
-            session_cipher_params,
+            session_cipher,
+            rotation_policy,
             match noise_role {
                 crate::session_noise::NoiseRole::Initiator => 0x01,
                 crate::session_noise::NoiseRole::Responder => 0x02,
@@ -594,6 +674,7 @@ async fn handle_connect(
             port: None,
             mode: "guaranteed".into(),
             peer: None,
+            resume_status: None,
         }));
     }
 
@@ -602,6 +683,129 @@ async fn handle_connect(
     cfg.tor_role = req.tor_role;
     if let Some(onion) = req.target_onion.clone() {
         cfg.tor_onion_addr = Some(onion);
+    }
+
+    if let Some(qr_str) = req.qr {
+        let qr = match HybridQrPayload::decode(&qr_str) {
+            Ok(q) => q,
+            Err(e) => {
+                tracing::warn!("Hybrid QR decode failed: {:?}", e);
+                return Err(connect_err(StatusCode::BAD_REQUEST, "invalid request"));
+            }
+        };
+        let offer_b64 = qr.offer.clone();
+        let resume = qr.resume_params();
+        let offer = match OfferPayload::decode(&offer_b64) {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::warn!("Offer decode failed: {:?}", e);
+                return Err(connect_err(StatusCode::BAD_REQUEST, "invalid request"));
+            }
+        };
+        let time_validator = TimeValidator::new();
+        if let Err(e) = offer.verify(&time_validator) {
+            tracing::warn!("Offer verify failed: {:?}", e);
+            return Err(connect_err(StatusCode::BAD_REQUEST, "invalid request"));
+        }
+
+        let local_role = req.local_role.unwrap_or(match offer.role_hint {
+            RoleHint::Host => RoleHint::Client,
+            RoleHint::Client => RoleHint::Host,
+        });
+
+        let result = match transport::establish_connection_from_offer_with_resume(
+            &offer,
+            &cfg,
+            local_role.clone(),
+            Some(resume),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("QR connect failed: {:?}", e);
+                return Err(connect_err(StatusCode::BAD_GATEWAY, "operation failed"));
+            }
+        };
+
+        let rl_duration = Duration::from_secs(cfg.rate_limit_time_window_s.max(1));
+        let rl = RateLimiter::new(
+            cfg.rate_limit_capacity,
+            cfg.rate_limit_max_requests,
+            rl_duration,
+        );
+
+        let (tx_out, rx_out) = mpsc::channel(DEFAULT_CHANNEL_CAPACITY);
+        app.set_tx_out(tx_out.clone()).await;
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        app.set_stop_tx(stop_tx).await;
+
+        let updated_streams = Streams {
+            tx: streams.tx,
+            rx: streams.rx,
+            tx_out,
+        };
+
+        tracing::info!("Session upgrade completed, session key installed");
+
+        let stop_rx1 = stop_rx.clone();
+        let tag8 = derive_tag8_from_key(&offer.rendezvous.key_enc).map_err(|e| {
+            tracing::error!("Tag8 derivation failed: {:?}", e);
+            connect_err(StatusCode::INTERNAL_SERVER_ERROR, "operation failed")
+        })?;
+        let session_cipher = Arc::new(tokio::sync::RwLock::new(SessionKeyState::new(
+            result.session_key,
+            offer.rendezvous.tag16,
+            tag8,
+            cfg.key_rotation_grace_ms(),
+        )));
+        let rotation_policy = cfg.key_rotation_policy();
+        let _rx_handle = crate::transport::tasks::spawn_receiver_task_with_stop(
+            result.conn.clone(),
+            updated_streams.clone(),
+            session_cipher.clone(),
+            rl,
+            stop_rx1,
+        )
+        .await;
+
+        let stop_rx2 = stop_rx.clone();
+        let metrics = app.get_metrics().await;
+        let _tx_handle = crate::transport::tasks::spawn_sender_task_with_stop(
+            result.conn,
+            rx_out,
+            stop_rx2,
+            metrics,
+            session_cipher,
+            rotation_policy,
+            match local_role {
+                RoleHint::Host => 0x02,
+                RoleHint::Client => 0x01,
+            },
+        )
+        .await;
+
+        let mode = result.mode.clone();
+        let peer = result.peer.clone();
+        let mut s = app.get_connection_state().await;
+        s.port = Some(offer.rendezvous.port);
+        s.mode = Some(mode.clone());
+        s.status = crate::state::ConnectionStatus::Connected;
+        s.peer_address = peer.clone();
+        app.set_connection_state(s).await;
+
+        let resume_status = match result.resume_used {
+            Some(true) => Some("used".to_string()),
+            Some(false) => Some("fallback".to_string()),
+            None => None,
+        };
+        return Ok(Json(ConnectionResponse {
+            status: "connected".into(),
+            port: Some(offer.rendezvous.port),
+            mode,
+            peer,
+            resume_status,
+        }));
     }
 
     if let Some(offer_b64) = req.offer {
@@ -658,11 +862,21 @@ async fn handle_connect(
         tracing::info!("Noise upgrade completed, session key installed");
 
         let stop_rx1 = stop_rx.clone();
-        let tag8 = derive_tag8_from_key(&offer.rendezvous.key_enc);
+        let tag8 = derive_tag8_from_key(&offer.rendezvous.key_enc).map_err(|e| {
+            tracing::error!("Tag8 derivation failed: {:?}", e);
+            connect_err(StatusCode::INTERNAL_SERVER_ERROR, "operation failed")
+        })?;
+        let session_cipher = Arc::new(tokio::sync::RwLock::new(SessionKeyState::new(
+            result.session_key,
+            offer.rendezvous.tag16,
+            tag8,
+            cfg.key_rotation_grace_ms(),
+        )));
+        let rotation_policy = cfg.key_rotation_policy();
         let _rx_handle = crate::transport::tasks::spawn_receiver_task_with_stop(
             result.conn.clone(),
             updated_streams.clone(),
-            (result.session_key, offer.rendezvous.tag16, tag8),
+            session_cipher.clone(),
             rl,
             stop_rx1,
         )
@@ -675,7 +889,8 @@ async fn handle_connect(
             rx_out,
             stop_rx2,
             metrics,
-            (result.session_key, offer.rendezvous.tag16, tag8),
+            session_cipher,
+            rotation_policy,
             match local_role {
                 RoleHint::Host => 0x02,
                 RoleHint::Client => 0x01,
@@ -697,6 +912,7 @@ async fn handle_connect(
             port: Some(offer.rendezvous.port),
             mode,
             peer,
+            resume_status: None,
         }));
     }
 
@@ -707,7 +923,10 @@ async fn handle_connect(
         }
     };
 
-    let params = derive_from_secret(&passphrase);
+    let params = derive_from_secret(&passphrase).map_err(|e| {
+        tracing::error!("Derivation failed: {:?}", e);
+        connect_err(StatusCode::INTERNAL_SERVER_ERROR, "operation failed")
+    })?;
 
     if !cfg.assist_relays.is_empty() {
         let is_host = match req.local_role {
@@ -776,7 +995,13 @@ async fn handle_connect(
             }
         };
 
-        let session_cipher_params = (session_key, params.tag16, params.tag8);
+        let session_cipher = Arc::new(tokio::sync::RwLock::new(SessionKeyState::new(
+            session_key,
+            params.tag16,
+            params.tag8,
+            cfg.key_rotation_grace_ms(),
+        )));
+        let rotation_policy = cfg.key_rotation_policy();
         tracing::info!("Noise upgrade completed, session key installed");
 
         let (tx_out, rx_out) = mpsc::channel(DEFAULT_CHANNEL_CAPACITY);
@@ -795,6 +1020,7 @@ async fn handle_connect(
             Connection::Lan(_, _) => "lan",
             Connection::Wan(_, _) => "wan",
             Connection::WanTorStream { .. } => "wan_tor",
+            Connection::WanTcpStream { .. } => "wan_tcp",
             Connection::Quic(_) => "quic",
             Connection::WebRtc(_) => "webrtc",
         }
@@ -805,7 +1031,7 @@ async fn handle_connect(
         let _rx_handle = crate::transport::tasks::spawn_receiver_task_with_stop(
             conn.clone(),
             updated_streams.clone(),
-            session_cipher_params,
+            session_cipher.clone(),
             rl,
             stop_rx1,
         )
@@ -819,7 +1045,8 @@ async fn handle_connect(
             rx_out,
             stop_rx2,
             metrics,
-            session_cipher_params,
+            session_cipher,
+            rotation_policy,
             match noise_role {
                 crate::session_noise::NoiseRole::Initiator => 0x01,
                 crate::session_noise::NoiseRole::Responder => 0x02,
@@ -840,6 +1067,7 @@ async fn handle_connect(
             port: Some(params.port),
             mode,
             peer,
+            resume_status: None,
         }));
     }
 
@@ -876,6 +1104,7 @@ async fn handle_connect(
                         port: state_snapshot.port,
                         mode,
                         peer: state_snapshot.peer_address,
+                        resume_status: None,
                     }));
                 }
 
@@ -907,6 +1136,7 @@ async fn handle_connect(
                     port: Some(params.port),
                     mode: "wan".into(),
                     peer: None,
+                    resume_status: None,
                 }));
             }
 
@@ -927,7 +1157,13 @@ async fn handle_connect(
                 }
             };
 
-            let session_cipher_params = (session_key, params.tag16, params.tag8);
+            let session_cipher = Arc::new(tokio::sync::RwLock::new(SessionKeyState::new(
+                session_key,
+                params.tag16,
+                params.tag8,
+                cfg.key_rotation_grace_ms(),
+            )));
+            let rotation_policy = cfg.key_rotation_policy();
             tracing::info!("Noise upgrade completed, session key installed");
 
             // Crea canale per sender task
@@ -949,6 +1185,7 @@ async fn handle_connect(
                 Connection::Lan(_, _) => "lan",
                 Connection::Wan(_, _) => "wan",
                 Connection::WanTorStream { .. } => "wan_tor",
+                Connection::WanTcpStream { .. } => "wan_tcp",
                 Connection::Quic(_) => "quic",
                 Connection::WebRtc(_) => "webrtc",
             }
@@ -960,7 +1197,7 @@ async fn handle_connect(
             let _rx_handle = crate::transport::tasks::spawn_receiver_task_with_stop(
                 conn.clone(),
                 updated_streams.clone(),
-                session_cipher_params, // Updated
+                session_cipher.clone(),
                 rl,
                 stop_rx1,
             )
@@ -975,7 +1212,8 @@ async fn handle_connect(
                 rx_out,
                 stop_rx2,
                 metrics,
-                session_cipher_params, // Updated
+                session_cipher,
+                rotation_policy,
                 match noise_role {
                     crate::session_noise::NoiseRole::Initiator => 0x01,
                     crate::session_noise::NoiseRole::Responder => 0x02,
@@ -996,6 +1234,7 @@ async fn handle_connect(
                 port: Some(params.port),
                 mode,
                 peer: peer_addr,
+                resume_status: None,
             }))
         }
         Err(e) => {
@@ -1109,14 +1348,20 @@ async fn accept_wan_direct_and_spawn(
     };
 
     let conn = Connection::Wan(sock.clone(), peer);
-    let session_cipher_params = (session_key, params.tag16, params.tag8);
+    let session_cipher = Arc::new(tokio::sync::RwLock::new(SessionKeyState::new(
+        session_key,
+        params.tag16,
+        params.tag8,
+        cfg.key_rotation_grace_ms(),
+    )));
+    let rotation_policy = cfg.key_rotation_policy();
     tracing::info!("Noise upgrade completed, session key installed");
 
     let stop_rx1 = stop_rx.clone();
     let _rx_handle = crate::transport::tasks::spawn_receiver_task_with_stop(
         conn.clone(),
         updated_streams.clone(),
-        session_cipher_params,
+        session_cipher.clone(),
         rl,
         stop_rx1,
     )
@@ -1129,7 +1374,8 @@ async fn accept_wan_direct_and_spawn(
         rx_out,
         stop_rx2,
         metrics,
-        session_cipher_params,
+        session_cipher,
+        rotation_policy,
         match noise_role {
             crate::session_noise::NoiseRole::Initiator => 0x01,
             crate::session_noise::NoiseRole::Responder => 0x02,
@@ -1194,6 +1440,7 @@ async fn handle_status(
         port: s.port,
         mode: s.mode.unwrap_or_else(|| "unknown".into()),
         peer: s.peer_address,
+        resume_status: None,
     }))
 }
 
@@ -1267,7 +1514,10 @@ async fn handle_set_passphrase(
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
     let secret = SecretString::from(req.passphrase);
-    let params = derive_from_secret(&secret);
+    let params = derive_from_secret(&secret).map_err(|e| {
+        tracing::error!("Derivation failed: {:?}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
     state
         .app
         .set_crypto_params(params.key_enc, params.tag16, params.tag8)
@@ -1384,6 +1634,7 @@ async fn handle_disconnect(
         port: None,
         mode: "none".into(),
         peer: None,
+        resume_status: None,
     }))
 }
 
@@ -1409,7 +1660,10 @@ async fn handle_phrase_open(
     let cfg = Config::from_env();
     let passphrase = req.passphrase;
     let secret = SecretString::from(passphrase);
-    let params = derive_from_secret(&secret);
+    let params = derive_from_secret(&secret).map_err(|e| {
+        tracing::error!("Derivation failed: {:?}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
     let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -1483,7 +1737,13 @@ async fn handle_phrase_open(
                 }
             };
 
-            let session_cipher_params = (session_key, params.tag16, params.tag8);
+            let session_cipher = Arc::new(tokio::sync::RwLock::new(SessionKeyState::new(
+                session_key,
+                params.tag16,
+                params.tag8,
+                cfg.key_rotation_grace_ms(),
+            )));
+            let rotation_policy = cfg.key_rotation_policy();
             tracing::info!("Noise upgrade completed, session key installed");
 
             let (tx_out, rx_out) = mpsc::channel(DEFAULT_CHANNEL_CAPACITY);
@@ -1509,7 +1769,7 @@ async fn handle_phrase_open(
             let _rx_handle = crate::transport::tasks::spawn_receiver_task_with_stop(
                 conn.clone(),
                 updated_streams.clone(),
-                session_cipher_params,
+                session_cipher.clone(),
                 rl,
                 stop_rx1,
             )
@@ -1522,7 +1782,8 @@ async fn handle_phrase_open(
                 rx_out,
                 stop_rx2,
                 metrics,
-                session_cipher_params,
+                session_cipher,
+                rotation_policy,
                 match noise_role {
                     crate::session_noise::NoiseRole::Initiator => 0x01,
                     crate::session_noise::NoiseRole::Responder => 0x02,
@@ -1617,7 +1878,10 @@ async fn handle_phrase_join(
 
     let passphrase = req.passphrase;
     let secret = SecretString::from(passphrase);
-    let params = derive_from_secret(&secret);
+    let params = derive_from_secret(&secret).map_err(|e| {
+        tracing::error!("Derivation failed: {:?}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     app.set_phrase_status(crate::state::PhraseStatus::Opening)
         .await;
@@ -1649,7 +1913,13 @@ async fn handle_phrase_join(
         }
     };
 
-    let session_cipher_params = (session_key, params.tag16, params.tag8);
+    let session_cipher = Arc::new(tokio::sync::RwLock::new(SessionKeyState::new(
+        session_key,
+        params.tag16,
+        params.tag8,
+        cfg.key_rotation_grace_ms(),
+    )));
+    let rotation_policy = cfg.key_rotation_policy();
     tracing::info!("Noise upgrade completed, session key installed");
 
     let (tx_out, rx_out) = mpsc::channel(DEFAULT_CHANNEL_CAPACITY);
@@ -1675,7 +1945,7 @@ async fn handle_phrase_join(
     let _rx_handle = crate::transport::tasks::spawn_receiver_task_with_stop(
         conn.clone(),
         updated_streams.clone(),
-        session_cipher_params,
+        session_cipher.clone(),
         rl,
         stop_rx1,
     )
@@ -1688,7 +1958,8 @@ async fn handle_phrase_join(
         rx_out,
         stop_rx2,
         metrics,
-        session_cipher_params,
+        session_cipher,
+        rotation_policy,
         match noise_role {
             crate::session_noise::NoiseRole::Initiator => 0x01,
             crate::session_noise::NoiseRole::Responder => 0x02,
@@ -1711,6 +1982,7 @@ async fn handle_phrase_join(
         port: Some(params.port),
         mode,
         peer: None,
+        resume_status: None,
     }))
 }
 

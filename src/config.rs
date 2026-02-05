@@ -1,4 +1,5 @@
 use crate::protocol_assist_v5::CandidatePolicy;
+use base64::{engine::general_purpose, Engine as _};
 use serde::{Deserialize, Serialize};
 
 pub const UDP_MAX_PACKET_SIZE: usize = 65535;
@@ -82,6 +83,9 @@ pub struct Config {
     pub circuit_breaker_failure_threshold: u32,
     pub circuit_breaker_success_threshold: u32,
     pub offer_endpoint_delay_ms: u64,
+    pub key_rotation_interval_s: u64,
+    pub key_rotation_max_messages: u64,
+    pub key_rotation_grace_s: u64,
     // Guaranteed transport settings
     pub guaranteed_relay_url: String,
     pub guaranteed_relay_wait_ms: u64,
@@ -100,6 +104,8 @@ pub struct Config {
     // Pluggable Transport settings
     pub pluggable_transport: PluggableTransportMode,
     pub pluggable_tls_domains: Vec<String>, // Domains for RealTls mode
+    pub pluggable_ws_host: String,          // Host header for WebSocket mimic
+    pub realtls_mimic_pins: Vec<TlsMimicryConfig>,
 
     // Multipath settings
     pub multipath_policy: String, // "redundant" or "split"
@@ -108,6 +114,13 @@ pub struct Config {
 
     // Capabilities for advanced features
     pub require_capabilities: bool, // true = require CAP_NET_RAW for ICMP
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlsMimicryConfig {
+    pub target_domain: String,
+    pub issuer_spki_hashes: Vec<[u8; 32]>,
+    pub enforce: bool, // true = reject if mismatch, false = warn only
 }
 
 impl Config {
@@ -130,6 +143,9 @@ impl Config {
             circuit_breaker_failure_threshold: 3,
             circuit_breaker_success_threshold: 2,
             offer_endpoint_delay_ms: 200,
+            key_rotation_interval_s: 3600,
+            key_rotation_max_messages: 1_000_000,
+            key_rotation_grace_s: 60,
             guaranteed_relay_url: String::new(),
             guaranteed_relay_wait_ms: 10_000,
             guaranteed_topic_window_ms: 300_000,
@@ -137,6 +153,8 @@ impl Config {
             // Pluggable Transport default
             pluggable_transport: PluggableTransportMode::default(),
             pluggable_tls_domains: vec!["www.cloudflare.com".into(), "api.google.com".into()],
+            pluggable_ws_host: "www.cloudflare.com".into(),
+            realtls_mimic_pins: Vec::new(),
             // Multipath defaults
             multipath_policy: "redundant".to_string(),
             multipath_switch_threshold_ms: 50,
@@ -275,6 +293,24 @@ impl Config {
             }
         }
 
+        if let Ok(value) = std::env::var("HANDSHACKE_KEY_ROTATION_INTERVAL_S") {
+            if let Ok(value) = value.parse::<u64>() {
+                config.key_rotation_interval_s = value;
+            }
+        }
+
+        if let Ok(value) = std::env::var("HANDSHACKE_KEY_ROTATION_MAX_MESSAGES") {
+            if let Ok(value) = value.parse::<u64>() {
+                config.key_rotation_max_messages = value;
+            }
+        }
+
+        if let Ok(value) = std::env::var("HANDSHACKE_KEY_ROTATION_GRACE_S") {
+            if let Ok(value) = value.parse::<u64>() {
+                config.key_rotation_grace_s = value;
+            }
+        }
+
         // Pluggable Transport settings
         if let Ok(pt) = std::env::var("HANDSHACKE_PLUGGABLE_TRANSPORT") {
             config.pluggable_transport = match pt.to_lowercase().as_str() {
@@ -285,12 +321,23 @@ impl Config {
                 "quic" => PluggableTransportMode::Quic,
                 _ => PluggableTransportMode::None,
             };
+
+            if config.pluggable_transport != PluggableTransportMode::None {
+                tracing::warn!(
+                    "PLUGGABLE_TRANSPORT WARNING: experimental feature enabled via HANDSHACKE_PLUGGABLE_TRANSPORT={}. This requires external server-side infrastructure (protocol-specific mimic + TLS/certs where applicable). If you are not operating that infrastructure, connections may fail or be fingerprintable.",
+                    pt
+                );
+            }
         }
 
         // Parse RealTls domain if specified
         if let Ok(domain) = std::env::var("HANDSHACKE_REALTLS_DOMAIN") {
             if !domain.trim().is_empty() {
-                config.pluggable_transport = PluggableTransportMode::RealTls(domain);
+                config.pluggable_transport = PluggableTransportMode::RealTls(domain.clone());
+                tracing::warn!(
+                    "REALTLS WARNING: RealTls enabled with domain={}. You must operate a server endpoint with a valid certificate for this domain (or a compatible bridge). Without external infra, RealTls will not work.",
+                    domain
+                );
             }
         }
 
@@ -300,6 +347,75 @@ impl Config {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
+        }
+
+        if let Ok(host) = std::env::var("HANDSHACKE_WS_HOST") {
+            if !host.trim().is_empty() {
+                config.pluggable_ws_host = host;
+            }
+        }
+
+        // RealTLS mimicry pinning (DPI evasion)
+        // Format: "domain|enforce:BASE64,BASE64;domain|warn:BASE64"
+        // Mode defaults to enforce if omitted.
+        if let Ok(pins) = std::env::var("HANDSHACKE_REALTLS_MIMIC_PINS") {
+            let mut parsed = Vec::new();
+            for entry in pins.split(';') {
+                let entry = entry.trim();
+                if entry.is_empty() {
+                    continue;
+                }
+                let (left, right) = match entry.split_once(':') {
+                    Some(v) => v,
+                    None => {
+                        tracing::warn!("Invalid mimic pin entry (missing ':'): {}", entry);
+                        continue;
+                    }
+                };
+                let mut enforce = true;
+                let mut domain = left.trim();
+                if let Some((d, mode)) = left.split_once('|') {
+                    domain = d.trim();
+                    enforce = !matches!(mode.trim().to_lowercase().as_str(), "warn" | "soft");
+                }
+                if domain.is_empty() {
+                    tracing::warn!("Invalid mimic pin entry (empty domain): {}", entry);
+                    continue;
+                }
+                let mut hashes = Vec::new();
+                for h in right.split(',') {
+                    let h = h.trim();
+                    if h.is_empty() {
+                        continue;
+                    }
+                    let decoded = general_purpose::STANDARD
+                        .decode(h)
+                        .or_else(|_| general_purpose::URL_SAFE_NO_PAD.decode(h));
+                    match decoded {
+                        Ok(bytes) if bytes.len() == 32 => {
+                            let mut out = [0u8; 32];
+                            out.copy_from_slice(&bytes);
+                            hashes.push(out);
+                        }
+                        Ok(_) => {
+                            tracing::warn!("Invalid mimic pin hash length for domain {}", domain);
+                        }
+                        Err(_) => {
+                            tracing::warn!("Invalid mimic pin base64 for domain {}", domain);
+                        }
+                    }
+                }
+                if hashes.is_empty() {
+                    tracing::warn!("No valid mimic pin hashes for domain {}", domain);
+                    continue;
+                }
+                parsed.push(TlsMimicryConfig {
+                    target_domain: domain.to_string(),
+                    issuer_spki_hashes: hashes,
+                    enforce,
+                });
+            }
+            config.realtls_mimic_pins = parsed;
         }
 
         // Multipath settings
@@ -364,6 +480,17 @@ impl Config {
         }
 
         config
+    }
+
+    pub fn key_rotation_policy(&self) -> crate::crypto::KeyRotationPolicy {
+        crate::crypto::KeyRotationPolicy {
+            interval_ms: self.key_rotation_interval_s.saturating_mul(1000),
+            max_messages: self.key_rotation_max_messages,
+        }
+    }
+
+    pub fn key_rotation_grace_ms(&self) -> u64 {
+        self.key_rotation_grace_s.saturating_mul(1000)
     }
 }
 

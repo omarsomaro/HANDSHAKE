@@ -1,6 +1,6 @@
 use anyhow::Result;
 use rand::RngCore;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use tokio::time::{Duration, Instant};
 
 const DISCOVERY_PREFIX: &[u8] = b"HS_DISCOVERY";
@@ -39,18 +39,31 @@ pub async fn try_lan_broadcast(port: u16) -> Result<(UdpSocket, SocketAddr)> {
 
 /// Restituisce indirizzi IP locali non-loopback
 pub fn get_local_ip_addresses() -> anyhow::Result<Vec<IpAddr>> {
-    let mut addrs = Vec::new();
+    let mut v6_addrs = Vec::new();
+    let mut v4_addrs = Vec::new();
     for iface in if_addrs::get_if_addrs()? {
         let ip = iface.ip();
         if ip.is_loopback() {
             continue;
         }
         match ip {
-            IpAddr::V4(_) => addrs.insert(0, ip),
-            IpAddr::V6(_) => addrs.push(ip),
+            IpAddr::V4(_) => v4_addrs.push(ip),
+            IpAddr::V6(v6) => {
+                if is_usable_ipv6(v6) {
+                    v6_addrs.push(IpAddr::V6(v6));
+                }
+            }
         }
     }
-    Ok(addrs)
+    v6_addrs.extend(v4_addrs);
+    Ok(v6_addrs)
+}
+
+fn is_usable_ipv6(ip: Ipv6Addr) -> bool {
+    if ip.is_loopback() || ip.is_multicast() || ip.is_unspecified() || ip.is_unicast_link_local() {
+        return false;
+    }
+    true
 }
 
 /// Ascolta per pacchetti di discovery LAN

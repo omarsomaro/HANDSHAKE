@@ -44,6 +44,7 @@ impl FrameType {
 pub struct WebSocketMimic {
     state: WebSocketState,
     key: String,
+    host: String,
 }
 
 #[derive(Debug)]
@@ -56,9 +57,11 @@ enum WebSocketState {
 
 impl WebSocketMimic {
     pub fn new() -> Self {
+        let host = crate::config::Config::from_env().pluggable_ws_host;
         Self {
             state: WebSocketState::New,
             key: String::new(),
+            host,
         }
     }
 
@@ -111,7 +114,7 @@ impl ProtocolMimicry for WebSocketMimic {
     async fn establish(&mut self, stream: &mut TcpStream) -> Result<()> {
         // Generate client handshake
         self.key = Self::generate_key();
-        let host = "www.cloudflare.com:80"; // Mimic popular host
+        let host = self.host.as_str(); // Configurable host
         let path = "/ws"; // Common WebSocket path
 
         let handshake = format!(
@@ -186,10 +189,14 @@ impl ProtocolMimicry for WebSocketMimic {
 
         // Masking key (random)
         let mask_key = util::random_bytes(4);
+        let mask_key_arr: [u8; 4] = mask_key
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Invalid mask key length"))?;
         frame.extend_from_slice(&mask_key);
 
         // Masked payload
-        let masked_payload = Self::mask_payload(data, &mask_key.try_into().unwrap());
+        let masked_payload = Self::mask_payload(data, &mask_key_arr);
         frame.extend_from_slice(&masked_payload);
 
         // Send frame

@@ -4,6 +4,7 @@
 // Handshacke - WAN Assist V5 (IP-blinded relay) - Versione patchata
 //
 
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -57,11 +58,12 @@ pub fn derive_entry_nonce_v5_improved(
     request_id: &[u8; 8],
     idx: usize,
     obf_key: &[u8; 32],
-) -> [u8; 12] {
+) -> Result<[u8; 12]> {
     use hmac::{Hmac, Mac};
     type HmacSha256 = Hmac<Sha256>;
 
-    let mut mac = HmacSha256::new_from_slice(obf_key).expect("HMAC init failed");
+    let mut mac =
+        HmacSha256::new_from_slice(obf_key).map_err(|_| anyhow::anyhow!("HMAC init failed"))?;
     mac.update(b"assist/nonce/v5");
     mac.update(request_id);
     mac.update(&(idx as u32).to_le_bytes());
@@ -69,13 +71,13 @@ pub fn derive_entry_nonce_v5_improved(
     let full = mac.finalize().into_bytes(); // 32B
     let mut nonce = [0u8; 12];
     nonce.copy_from_slice(&full[..12]);
-    nonce
+    Ok(nonce)
 }
 
 // ================ PATCH 2 & 3: PACK/UNPACK CON PADDING KEYED ================
 
 /// Pack SocketAddr into 24 bytes con padding dipendente da key e nonce
-fn pack_addr24(addr: &SocketAddr, obf_key: &[u8; 32], nonce12: &[u8; 12]) -> [u8; 24] {
+fn pack_addr24(addr: &SocketAddr, obf_key: &[u8; 32], nonce12: &[u8; 12]) -> Result<[u8; 24]> {
     let mut out = [0u8; 24];
 
     match addr.ip() {
@@ -97,14 +99,15 @@ fn pack_addr24(addr: &SocketAddr, obf_key: &[u8; 32], nonce12: &[u8; 12]) -> [u8
     // Keyed padding (deterministic ma dipendente da nonce)
     use hmac::{Hmac, Mac};
     type HmacSha256 = Hmac<Sha256>;
-    let mut mac = HmacSha256::new_from_slice(obf_key).expect("HMAC init failed");
+    let mut mac =
+        HmacSha256::new_from_slice(obf_key).map_err(|_| anyhow::anyhow!("HMAC init failed"))?;
     mac.update(b"assist/pad/v5");
     mac.update(nonce12);
     mac.update(&out[..19]);
     let pad = mac.finalize().into_bytes(); // 32B
     out[19..24].copy_from_slice(&pad[..5]);
 
-    out
+    Ok(out)
 }
 
 /// Unpack 24 bytes into SocketAddr (versione originale)
@@ -127,11 +130,11 @@ fn unpack_addr24(buf: &[u8; 24]) -> Option<SocketAddr> {
 }
 
 impl BlindedCandidate {
-    pub fn blind(addr: &SocketAddr, obf_key: &[u8; 32], nonce12: &[u8; 12]) -> Self {
-        let mut buf = pack_addr24(addr, obf_key, nonce12);
+    pub fn blind(addr: &SocketAddr, obf_key: &[u8; 32], nonce12: &[u8; 12]) -> Result<Self> {
+        let mut buf = pack_addr24(addr, obf_key, nonce12)?;
         let mut cipher = ChaCha20::new(obf_key.into(), nonce12.into());
         cipher.apply_keystream(&mut buf);
-        Self(buf)
+        Ok(Self(buf))
     }
 
     pub fn unblind(&self, obf_key: &[u8; 32], nonce12: &[u8; 12]) -> Option<SocketAddr> {
@@ -228,25 +231,27 @@ pub fn is_usable_candidate(addr: &SocketAddr, policy: CandidatePolicy) -> bool {
 // ================ FUNZIONI AUSILIARIE ================
 
 /// Domain separated obfuscation key for v5 assist.
-pub fn derive_obfuscation_key_v5(key_enc: &[u8; 32], tag16: u16) -> [u8; 32] {
+pub fn derive_obfuscation_key_v5(key_enc: &[u8; 32], tag16: u16) -> Result<[u8; 32]> {
     let hk = Hkdf::<Sha256>::new(Some(b"hs/assist/ip-blind/v5"), key_enc);
     let mut out = [0u8; 32];
     let mut info = Vec::with_capacity(3 + 2);
     info.extend_from_slice(b"obf");
     info.extend_from_slice(&tag16.to_be_bytes());
-    hk.expand(&info, &mut out).expect("HKDF expand failed");
-    out
+    hk.expand(&info, &mut out)
+        .map_err(|e| anyhow::anyhow!("HKDF expand failed: {:?}", e))?;
+    Ok(out)
 }
 
 /// Nonce originale per compatibilità (non usato nella versione migliorata)
-pub fn derive_entry_nonce_v5(request_id: &[u8; 8], idx: usize) -> [u8; 12] {
+pub fn derive_entry_nonce_v5(request_id: &[u8; 8], idx: usize) -> Result<[u8; 12]> {
     let hk = Hkdf::<Sha256>::new(None, request_id);
     let mut nonce = [0u8; 12];
     let mut info = Vec::with_capacity(14);
     info.extend_from_slice(b"assist/nonce/v5");
     info.extend_from_slice(&(idx as u32).to_le_bytes());
-    hk.expand(&info, &mut nonce).expect("HKDF expand failed");
-    nonce
+    hk.expand(&info, &mut nonce)
+        .map_err(|e| anyhow::anyhow!("HKDF expand failed: {:?}", e))?;
+    Ok(nonce)
 }
 
 // ================ GENERAZIONE DUMMY ================
@@ -297,7 +302,7 @@ pub fn make_blinded_candidates_v5_shuffled(
     real_addrs: &[SocketAddr],
     obf_key: &[u8; 32],
     request_id: &[u8; 8],
-) -> [BlindedCandidate; ASSIST_V5_CANDIDATES] {
+) -> Result<[BlindedCandidate; ASSIST_V5_CANDIDATES]> {
     let mut out = [BlindedCandidate::default(); ASSIST_V5_CANDIDATES];
     let mut positions: Vec<usize> = (0..ASSIST_V5_CANDIDATES).collect();
 
@@ -312,18 +317,18 @@ pub fn make_blinded_candidates_v5_shuffled(
     let take_n = real_addrs.len().min(ASSIST_V5_CANDIDATES);
     for i in 0..take_n {
         let pos = positions[i];
-        let nonce = derive_entry_nonce_v5_improved(request_id, pos, obf_key);
-        out[pos] = BlindedCandidate::blind(&real_addrs[i], obf_key, &nonce);
+        let nonce = derive_entry_nonce_v5_improved(request_id, pos, obf_key)?;
+        out[pos] = BlindedCandidate::blind(&real_addrs[i], obf_key, &nonce)?;
     }
 
     // Fill remaining positions with dummies
     for &pos in positions.iter().skip(take_n) {
         let dummy = generate_dummy_candidate(pos);
-        let nonce = derive_entry_nonce_v5_improved(request_id, pos, obf_key);
-        out[pos] = BlindedCandidate::blind(&dummy, obf_key, &nonce);
+        let nonce = derive_entry_nonce_v5_improved(request_id, pos, obf_key)?;
+        out[pos] = BlindedCandidate::blind(&dummy, obf_key, &nonce)?;
     }
 
-    out
+    Ok(out)
 }
 
 // ================ ANTI-CLUSTERING ================
@@ -333,7 +338,7 @@ pub fn make_blinded_candidates_v5_anti_cluster(
     real_addrs: &[SocketAddr],
     obf_key: &[u8; 32],
     request_id: &[u8; 8],
-) -> [BlindedCandidate; ASSIST_V5_CANDIDATES] {
+) -> Result<[BlindedCandidate; ASSIST_V5_CANDIDATES]> {
     let mut out = [BlindedCandidate::default(); ASSIST_V5_CANDIDATES];
     let real_count = real_addrs.len().min(ASSIST_V5_CANDIDATES);
 
@@ -346,30 +351,31 @@ pub fn make_blinded_candidates_v5_anti_cluster(
 
     for (i, addr) in real_addrs.iter().take(real_count).enumerate() {
         let pos = (i * step) % ASSIST_V5_CANDIDATES;
-        let nonce = derive_entry_nonce_v5_improved(request_id, pos, obf_key);
-        out[pos] = BlindedCandidate::blind(addr, obf_key, &nonce);
+        let nonce = derive_entry_nonce_v5_improved(request_id, pos, obf_key)?;
+        out[pos] = BlindedCandidate::blind(addr, obf_key, &nonce)?;
     }
 
     // Fill gaps with dummies
     for (i, slot) in out.iter_mut().enumerate().take(ASSIST_V5_CANDIDATES) {
         if slot.0 == [0u8; 24] {
             let dummy = generate_dummy_candidate(i);
-            let nonce = derive_entry_nonce_v5_improved(request_id, i, obf_key);
-            *slot = BlindedCandidate::blind(&dummy, obf_key, &nonce);
+            let nonce = derive_entry_nonce_v5_improved(request_id, i, obf_key)?;
+            *slot = BlindedCandidate::blind(&dummy, obf_key, &nonce)?;
         }
     }
 
-    out
+    Ok(out)
 }
 
 // ================ MAC FUNCTIONS ================
 
 /// Compute HMAC over V5 request
-pub fn compute_assist_mac_v5(key_enc: &[u8; 32], req: &AssistRequestV5) -> [u8; 32] {
+pub fn compute_assist_mac_v5(key_enc: &[u8; 32], req: &AssistRequestV5) -> Result<[u8; 32]> {
     use hmac::{Hmac, Mac};
     type HmacSha256 = Hmac<Sha256>;
 
-    let mut mac = HmacSha256::new_from_slice(key_enc).expect("HMAC init failed");
+    let mut mac =
+        HmacSha256::new_from_slice(key_enc).map_err(|_| anyhow::anyhow!("HMAC init failed"))?;
     mac.update(b"assist-mac-v5");
     mac.update(&req.request_id);
     for c in &req.blinded_candidates {
@@ -382,19 +388,22 @@ pub fn compute_assist_mac_v5(key_enc: &[u8; 32], req: &AssistRequestV5) -> [u8; 
     } else {
         mac.update(&[0u8; 8]);
     }
-    mac.finalize().into_bytes().into()
+    Ok(mac.finalize().into_bytes().into())
 }
 
 pub fn verify_assist_mac_v5(key_enc: &[u8; 32], req: &AssistRequestV5) -> bool {
-    let want = compute_assist_mac_v5(key_enc, req);
-    bool::from(want.ct_eq(&req.mac))
+    match compute_assist_mac_v5(key_enc, req) {
+        Ok(want) => bool::from(want.ct_eq(&req.mac)),
+        Err(_) => false,
+    }
 }
 
-pub fn compute_assist_go_mac_v5(key_enc: &[u8; 32], go: &AssistGoV5) -> [u8; 32] {
+pub fn compute_assist_go_mac_v5(key_enc: &[u8; 32], go: &AssistGoV5) -> Result<[u8; 32]> {
     use hmac::{Hmac, Mac};
     type HmacSha256 = Hmac<Sha256>;
 
-    let mut mac = HmacSha256::new_from_slice(key_enc).expect("HMAC init failed");
+    let mut mac =
+        HmacSha256::new_from_slice(key_enc).map_err(|_| anyhow::anyhow!("HMAC init failed"))?;
     mac.update(b"assist-go-mac-v5");
     mac.update(&go.request_id);
     for c in &go.peer_candidates {
@@ -402,14 +411,17 @@ pub fn compute_assist_go_mac_v5(key_enc: &[u8; 32], go: &AssistGoV5) -> [u8; 32]
     }
     mac.update(&go.go_after_ms.to_le_bytes());
     mac.update(&go.burst_duration_ms.to_le_bytes());
-    mac.update(&bincode::serialize(&go.punch_profile).expect("punch_profile serialize"));
+    let punch_bytes = bincode::serialize(&go.punch_profile).map_err(|e| anyhow::anyhow!(e))?;
+    mac.update(&punch_bytes);
     mac.update(&go.ttl_ms.to_le_bytes());
-    mac.finalize().into_bytes().into()
+    Ok(mac.finalize().into_bytes().into())
 }
 
 pub fn verify_assist_go_mac_v5(key_enc: &[u8; 32], go: &AssistGoV5) -> bool {
-    let want = compute_assist_go_mac_v5(key_enc, go);
-    bool::from(want.ct_eq(&go.mac))
+    match compute_assist_go_mac_v5(key_enc, go) {
+        Ok(want) => bool::from(want.ct_eq(&go.mac)),
+        Err(_) => false,
+    }
 }
 
 // ================ RATE LIMITING ================
@@ -427,16 +439,16 @@ mod tests {
         let obf_key = [42u8; 32];
         let request_id = [1u8; 8];
 
-        let nonce1 = derive_entry_nonce_v5_improved(&request_id, 0, &obf_key);
-        let nonce2 = derive_entry_nonce_v5_improved(&request_id, 1, &obf_key);
-        let nonce3 = derive_entry_nonce_v5_improved(&request_id, 0, &obf_key); // stesso idx
+        let nonce1 = derive_entry_nonce_v5_improved(&request_id, 0, &obf_key).unwrap();
+        let nonce2 = derive_entry_nonce_v5_improved(&request_id, 1, &obf_key).unwrap();
+        let nonce3 = derive_entry_nonce_v5_improved(&request_id, 0, &obf_key).unwrap(); // stesso idx
 
         assert_ne!(nonce1, nonce2, "Nonce diversi per idx diversi");
         assert_eq!(nonce1, nonce3, "Nonce uguali per stessi parametri");
 
         // Cambia key → nonce diverso
         let obf_key2 = [43u8; 32];
-        let nonce4 = derive_entry_nonce_v5_improved(&request_id, 0, &obf_key2);
+        let nonce4 = derive_entry_nonce_v5_improved(&request_id, 0, &obf_key2).unwrap();
         assert_ne!(nonce1, nonce4, "Nonce diverso per key diversa");
     }
 
@@ -446,13 +458,13 @@ mod tests {
         let obf_key = [1u8; 32];
         let nonce = [2u8; 12];
 
-        let packed1 = pack_addr24(&addr, &obf_key, &nonce);
-        let packed2 = pack_addr24(&addr, &obf_key, &nonce);
+        let packed1 = pack_addr24(&addr, &obf_key, &nonce).unwrap();
+        let packed2 = pack_addr24(&addr, &obf_key, &nonce).unwrap();
         assert_eq!(packed1, packed2, "Stesso output per stessi input");
 
         // Cambia nonce → padding diverso
         let nonce2 = [3u8; 12];
-        let packed3 = pack_addr24(&addr, &obf_key, &nonce2);
+        let packed3 = pack_addr24(&addr, &obf_key, &nonce2).unwrap();
         assert_ne!(
             &packed1[19..],
             &packed3[19..],
@@ -461,7 +473,7 @@ mod tests {
 
         // Cambia key → padding diverso
         let obf_key2 = [4u8; 32];
-        let packed4 = pack_addr24(&addr, &obf_key2, &nonce);
+        let packed4 = pack_addr24(&addr, &obf_key2, &nonce).unwrap();
         assert_ne!(
             &packed1[19..],
             &packed4[19..],
@@ -496,14 +508,14 @@ mod tests {
     fn test_blind_unblind_roundtrip() {
         let key_enc = [42u8; 32];
         let tag16 = 0x1234;
-        let obf_key = derive_obfuscation_key_v5(&key_enc, tag16);
+        let obf_key = derive_obfuscation_key_v5(&key_enc, tag16).unwrap();
         let request_id = [7u8; 8];
 
         let addr: SocketAddr = "[2001:4860:4860::8888]:53".parse().unwrap();
         let idx = 3;
-        let nonce = derive_entry_nonce_v5_improved(&request_id, idx, &obf_key);
+        let nonce = derive_entry_nonce_v5_improved(&request_id, idx, &obf_key).unwrap();
 
-        let blinded = BlindedCandidate::blind(&addr, &obf_key, &nonce);
+        let blinded = BlindedCandidate::blind(&addr, &obf_key, &nonce).unwrap();
         let unblinded = blinded.unblind(&obf_key, &nonce).unwrap();
 
         assert_eq!(addr, unblinded);
@@ -512,13 +524,14 @@ mod tests {
     #[test]
     fn test_shuffled_candidates() {
         let key_enc = [1u8; 32];
-        let obf_key = derive_obfuscation_key_v5(&key_enc, 0x9999);
+        let obf_key = derive_obfuscation_key_v5(&key_enc, 0x9999).unwrap();
         let request_id = [2u8; 8];
 
         let addrs: Vec<SocketAddr> =
             vec!["8.8.8.8:53".parse().unwrap(), "1.1.1.1:53".parse().unwrap()];
 
-        let candidates = make_blinded_candidates_v5_shuffled(&addrs, &obf_key, &request_id);
+        let candidates =
+            make_blinded_candidates_v5_shuffled(&addrs, &obf_key, &request_id).unwrap();
 
         // Verifica che abbiamo esattamente 8 candidati
         assert_eq!(candidates.len(), ASSIST_V5_CANDIDATES);
@@ -531,7 +544,7 @@ mod tests {
         // Verifica che possiamo unblind e validare
         let mut found_real = 0;
         for (idx, cand) in candidates.iter().enumerate() {
-            let nonce = derive_entry_nonce_v5_improved(&request_id, idx, &obf_key);
+            let nonce = derive_entry_nonce_v5_improved(&request_id, idx, &obf_key).unwrap();
             if let Some(addr) = cand.unblind(&obf_key, &nonce) {
                 if is_usable_candidate(&addr, CandidatePolicy::StrictWan) {
                     found_real += 1;
@@ -545,9 +558,9 @@ mod tests {
     fn test_mac_verify_v5() {
         let key_enc = [9u8; 32];
         let request_id = [3u8; 8];
-        let obf_key = derive_obfuscation_key_v5(&key_enc, 0x7777);
+        let obf_key = derive_obfuscation_key_v5(&key_enc, 0x7777).unwrap();
         let addrs: Vec<SocketAddr> = vec!["8.8.8.8:53".parse().unwrap()];
-        let blinded = make_blinded_candidates_v5_shuffled(&addrs, &obf_key, &request_id);
+        let blinded = make_blinded_candidates_v5_shuffled(&addrs, &obf_key, &request_id).unwrap();
         let mut req = AssistRequestV5 {
             request_id,
             blinded_candidates: blinded,
@@ -556,7 +569,7 @@ mod tests {
             dandelion_tag: Some([42u8; 8]),
             mac: [0u8; 32],
         };
-        req.mac = compute_assist_mac_v5(&key_enc, &req);
+        req.mac = compute_assist_mac_v5(&key_enc, &req).unwrap();
         assert!(verify_assist_mac_v5(&key_enc, &req));
 
         let go = AssistGoV5 {
@@ -573,7 +586,7 @@ mod tests {
             mac: [0u8; 32],
         };
         let mut go2 = go.clone();
-        go2.mac = compute_assist_go_mac_v5(&key_enc, &go2);
+        go2.mac = compute_assist_go_mac_v5(&key_enc, &go2).unwrap();
         assert!(verify_assist_go_mac_v5(&key_enc, &go2));
     }
 }

@@ -13,16 +13,20 @@ This document describes the core architecture and the responsibilities of each l
    - Deterministic parameters derived from passphrase
    - Offer commit (HMAC) for integrity
    - Optional Tor endpoint encryption
+   - Hybrid QR: resume token + deterministic fallback offer
 
 2) Transport
    - LAN, WAN direct, WAN assist, Tor fallback
+   - STUN discovery and hole punching (QR/offer aware)
+   - TCP fallback when UDP is blocked (target connect)
    - Multipath/ICE racing for best path
    - Pluggable transports for DPI evasion
    - Optional QUIC and WebRTC for standards-based connectivity
 
 3) Session security
    - Noise XX handshake upgrade
-   - PQ hybrid only on stream transports (if enabled)
+   - PQ hybrid only on stream transports (if enabled) with classic fallback
+   - Key rotation with grace window
 
 4) Messaging
    - Framed streams for reliability
@@ -36,6 +40,12 @@ This document describes the core architecture and the responsibilities of each l
 4) Connection is established on best transport
 5) Noise handshake upgrades the session key
 6) App data uses the session key with replay protection
+
+## QR Reasoning (Why QR Is Primary for UX)
+- QR payloads are **time-limited rendezvous envelopes**, not passwords.
+- They encode endpoints + timing so peers align without manual typing.
+- Hybrid QR improves reliability by combining resume tokens with deterministic fallback.
+- Phrase QR keeps Tor invite separate from the passphrase for privacy.
 
 ## Invariants and limits
 - UDP packets: bounded by MAX_UDP_PACKET_BYTES

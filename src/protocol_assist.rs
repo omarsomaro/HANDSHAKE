@@ -1,6 +1,7 @@
 //! Control protocol per WAN Assist (hole punching coordinato)
 //! Zero-infrastructure, ephemeral, zero-trust
 
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
@@ -44,14 +45,15 @@ pub struct PunchProfile {
 }
 
 /// Calcola HMAC su AssistRequest (deterministico, no bincode)
-pub fn compute_assist_mac(key_enc: &[u8; 32], request: &AssistRequest) -> [u8; 32] {
+pub fn compute_assist_mac(key_enc: &[u8; 32], request: &AssistRequest) -> Result<[u8; 32]> {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
     use std::net::IpAddr;
     type HmacSha256 = Hmac<Sha256>;
     const MAX_UDP_CANDIDATES: usize = 10;
 
-    let mut mac = HmacSha256::new_from_slice(key_enc).expect("HMAC init failed");
+    let mut mac =
+        HmacSha256::new_from_slice(key_enc).map_err(|_| anyhow::anyhow!("HMAC init failed"))?;
     mac.update(b"assist-mac-v1");
     mac.update(&request.request_id);
 
@@ -87,5 +89,5 @@ pub fn compute_assist_mac(key_enc: &[u8; 32], request: &AssistRequest) -> [u8; 3
     }
 
     mac.update(&request.ttl_ms.to_le_bytes());
-    mac.finalize().into_bytes().into()
+    Ok(mac.finalize().into_bytes().into())
 }

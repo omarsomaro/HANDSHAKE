@@ -27,6 +27,7 @@ cargo test --no-default-features
   - Enables Kyber hybrid primitives and Noise HFS params
   - Module: `crypto::post_quantum`
   - Noise uses PQ only on stream transports
+  - If PQ fails/unavailable, classic XX is used as fallback
 
 ## Suggested builds
 - Core only: `cargo build --no-default-features`

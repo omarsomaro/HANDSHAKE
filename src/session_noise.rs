@@ -3,17 +3,23 @@ use crate::config::UDP_MAX_PACKET_SIZE;
 use crate::crypto::post_quantum::NOISE_PARAMS_PQ;
 use crate::crypto::{
     self, deserialize_cipher_packet_with_limit, open, seal_with_nonce, ClearPayload, NonceSeq,
-    MAX_TCP_FRAME_BYTES, MAX_UDP_PACKET_BYTES, NONCE_DOMAIN_NOISE,
+    MAX_TCP_FRAME_BYTES, MAX_UDP_PACKET_BYTES, NONCE_DOMAIN_NOISE, NONCE_DOMAIN_RESUME,
 };
 use crate::protocol::Control;
+use crate::resume::ResumeParams;
 use crate::transport::Connection;
 use anyhow::{anyhow, bail, Result};
+use hkdf::Hkdf;
 use rand::RngCore;
+use sha2::Sha256;
 use snow::{Builder, HandshakeState};
 use std::future::Future;
+use tokio::time::{timeout, Duration};
 
 const NOISE_PARAMS_CLASSIC: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 const MAX_NOISE_MESSAGE_BYTES: usize = 8 * 1024;
+const RESUME_TIMEOUT_MS: u64 = 2000;
+const RESUME_MAX_SKEW_MS: u64 = 5000;
 
 /// Protocol state validation to prevent state machine attacks
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +67,21 @@ pub fn validate_protocol_transition(
                 }
             }
         }
+        (ProtocolState::Handshake, Control::SessionKeyAck(_)) => ProtocolValidation {
+            is_valid: false,
+            state: ProtocolState::Handshake,
+            error: Some("SessionKeyAck received during handshake".to_string()),
+        },
+        (ProtocolState::Handshake, Control::ResumeHello { .. }) => ProtocolValidation {
+            is_valid: true,
+            state: ProtocolState::Handshake,
+            error: None,
+        },
+        (ProtocolState::Handshake, Control::ResumeAccept { .. }) => ProtocolValidation {
+            is_valid: true,
+            state: ProtocolState::Handshake,
+            error: None,
+        },
         // Invalid messages during handshake
         (ProtocolState::Handshake, Control::App(_)) => ProtocolValidation {
             is_valid: false,
@@ -104,6 +125,21 @@ pub fn validate_protocol_transition(
             state: ProtocolState::Transport,
             error: None,
         },
+        (ProtocolState::Transport, Control::SessionKeyAck(_)) => ProtocolValidation {
+            is_valid: true,
+            state: ProtocolState::Transport,
+            error: None,
+        },
+        (ProtocolState::Transport, Control::ResumeHello { .. }) => ProtocolValidation {
+            is_valid: false,
+            state: ProtocolState::Transport,
+            error: Some("ResumeHello received in transport mode".to_string()),
+        },
+        (ProtocolState::Transport, Control::ResumeAccept { .. }) => ProtocolValidation {
+            is_valid: false,
+            state: ProtocolState::Transport,
+            error: Some("ResumeAccept received in transport mode".to_string()),
+        },
         (ProtocolState::Transport, Control::AssistRequest(_) | Control::AssistGo(_)) => {
             ProtocolValidation {
                 is_valid: true,
@@ -133,7 +169,10 @@ impl ProtocolState {
         use crate::protocol::Control;
         matches!(
             (self, message_type),
-            (ProtocolState::Handshake, Control::NoiseHandshake(_)) | (ProtocolState::Transport, _)
+            (ProtocolState::Handshake, Control::NoiseHandshake(_))
+                | (ProtocolState::Handshake, Control::ResumeHello { .. })
+                | (ProtocolState::Handshake, Control::ResumeAccept { .. })
+                | (ProtocolState::Transport, _)
         )
     }
 
@@ -142,7 +181,10 @@ impl ProtocolState {
         use crate::protocol::Control;
         matches!(
             (self, message_type),
-            (ProtocolState::Handshake, Control::NoiseHandshake(_)) | (ProtocolState::Transport, _)
+            (ProtocolState::Handshake, Control::NoiseHandshake(_))
+                | (ProtocolState::Handshake, Control::ResumeHello { .. })
+                | (ProtocolState::Handshake, Control::ResumeAccept { .. })
+                | (ProtocolState::Transport, _)
         )
     }
 }
@@ -160,6 +202,10 @@ async fn send_raw(conn: &Connection, data: Vec<u8>) -> Result<()> {
             sock.send_to(&data, *addr).await?;
         }
         Connection::WanTorStream { writer, .. } => {
+            let mut guard = writer.lock().await;
+            crate::transport::framing::write_frame(&mut *guard, &data).await?;
+        }
+        Connection::WanTcpStream { writer, .. } => {
             let mut guard = writer.lock().await;
             crate::transport::framing::write_frame(&mut *guard, &data).await?;
         }
@@ -185,6 +231,10 @@ async fn recv_raw(conn: &Connection) -> Result<Vec<u8>> {
             let mut guard = reader.lock().await;
             crate::transport::framing::read_frame(&mut *guard).await
         }
+        Connection::WanTcpStream { reader, .. } => {
+            let mut guard = reader.lock().await;
+            crate::transport::framing::read_frame(&mut *guard).await
+        }
         Connection::Quic(quic) => quic.recv().await,
         Connection::WebRtc(webrtc) => webrtc.recv().await,
     }
@@ -195,24 +245,6 @@ fn max_packet_limit(conn: &Connection) -> u64 {
         Connection::WebRtc(_) => crate::transport::webrtc::WEBRTC_MAX_MESSAGE_BYTES as u64,
         _ if conn.is_stream() => MAX_TCP_FRAME_BYTES,
         _ => MAX_UDP_PACKET_BYTES,
-    }
-}
-
-fn select_noise_params(conn: &Connection) -> Result<snow::params::NoiseParams> {
-    if conn.is_stream() {
-        #[cfg(feature = "pq")]
-        {
-            tracing::info!("Noise PQ enabled for stream connection");
-            pq_noise_params()
-        }
-        #[cfg(not(feature = "pq"))]
-        {
-            tracing::info!("Noise PQ feature disabled; using classic XX");
-            classic_noise_params()
-        }
-    } else {
-        tracing::info!("Noise PQ disabled for UDP; using classic XX to fit MTU");
-        classic_noise_params()
     }
 }
 
@@ -257,7 +289,50 @@ pub async fn run_noise_upgrade(
     tag8: u8,
 ) -> Result<[u8; 32]> {
     let limit = max_packet_limit(conn);
-    let params = select_noise_params(conn)?;
+
+    if conn.is_stream() {
+        #[cfg(feature = "pq")]
+        {
+            match pq_noise_params() {
+                Ok(params) => {
+                    match run_noise_upgrade_io(
+                        role,
+                        |data: Vec<u8>| async move { send_raw(conn, data).await },
+                        || async move { recv_raw(conn).await },
+                        base_key,
+                        tag16,
+                        tag8,
+                        params,
+                        limit,
+                    )
+                    .await
+                    {
+                        Ok(k) => return Ok(k),
+                        Err(e) => {
+                            tracing::warn!(
+                                "Noise PQ handshake failed ({}), falling back to classic",
+                                e
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Noise PQ params unavailable ({}), falling back to classic",
+                        e
+                    );
+                }
+            }
+        }
+        #[cfg(not(feature = "pq"))]
+        {
+            tracing::info!("Noise PQ feature disabled; using classic XX");
+        }
+    } else {
+        tracing::info!("Noise PQ disabled for UDP; using classic XX to fit MTU");
+    }
+
+    let params = classic_noise_params()?;
     run_noise_upgrade_io(
         role,
         |data: Vec<u8>| async move { send_raw(conn, data).await },
@@ -269,6 +344,205 @@ pub async fn run_noise_upgrade(
         limit,
     )
     .await
+}
+
+pub async fn run_resume_upgrade(
+    role: NoiseRole,
+    conn: &Connection,
+    base_key: &[u8; 32],
+    tag16: u16,
+    tag8: u8,
+    resume: &ResumeParams,
+) -> Result<[u8; 32]> {
+    let limit = max_packet_limit(conn);
+    run_resume_upgrade_io(
+        role,
+        |data: Vec<u8>| async move { send_raw(conn, data).await },
+        || async move { recv_raw(conn).await },
+        base_key,
+        tag16,
+        tag8,
+        resume,
+        limit,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_resume_upgrade_io<FSend, FRecv, FS, FR>(
+    role: NoiseRole,
+    send: FSend,
+    mut recv: FRecv,
+    base_key: &[u8; 32],
+    tag16: u16,
+    tag8: u8,
+    resume: &ResumeParams,
+    limit: u64,
+) -> Result<[u8; 32]>
+where
+    FSend: Fn(Vec<u8>) -> FS + Send + Sync,
+    FS: Future<Output = Result<()>> + Send,
+    FRecv: FnMut() -> FR + Send,
+    FR: Future<Output = Result<Vec<u8>>> + Send,
+{
+    if resume.is_expired() {
+        bail!("Resume ticket expired");
+    }
+
+    let role_byte = match role {
+        NoiseRole::Initiator => 0x01,
+        NoiseRole::Responder => 0x02,
+    };
+    let mut nonce_seq = NonceSeq::new_boot_random(base_key, NONCE_DOMAIN_RESUME, role_byte)?;
+    match role {
+        NoiseRole::Initiator => {
+            let mut client_nonce = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut client_nonce);
+            client_nonce[0] = 0x01;
+            let ctrl = Control::ResumeHello {
+                token_id: resume.token_id,
+                client_nonce,
+                ts_ms: crypto::now_ms(),
+            };
+            let payload_bytes = bincode::serialize(&ctrl)?;
+            let (nonce, seq) = nonce_seq.next_nonce_and_seq()?;
+            let clear = ClearPayload {
+                ts_ms: crypto::now_ms(),
+                seq,
+                data: payload_bytes,
+            };
+            let pkt = seal_with_nonce(base_key, tag16, tag8, &clear, &nonce)?;
+            let raw_bytes = crypto::serialize_cipher_packet(&pkt)?;
+            send(raw_bytes).await?;
+
+            let raw = recv().await?;
+            if raw.len() > limit as usize {
+                bail!("Resume message too large: {} > {}", raw.len(), limit);
+            }
+            let pkt = deserialize_cipher_packet_with_limit(&raw, limit)?;
+            let clear = open(base_key, &pkt, tag16, tag8)
+                .ok_or_else(|| anyhow!("Resume handshake: invalid base packet"))?;
+            let ctrl: Control = bincode::deserialize(&clear.data)?;
+            let (token_id, server_nonce) = match ctrl {
+                Control::ResumeAccept {
+                    token_id,
+                    server_nonce,
+                } => (token_id, server_nonce),
+                _ => bail!("Unexpected resume response"),
+            };
+            if token_id != resume.token_id {
+                bail!("Resume token mismatch");
+            }
+            if server_nonce[0] != 0x02 {
+                bail!("Resume server nonce invalid");
+            }
+            Ok(derive_resume_session_key(
+                &resume.resume_secret,
+                &client_nonce,
+                &server_nonce,
+            )?)
+        }
+        NoiseRole::Responder => {
+            let raw = recv().await?;
+            if raw.len() > limit as usize {
+                bail!("Resume message too large: {} > {}", raw.len(), limit);
+            }
+            let pkt = deserialize_cipher_packet_with_limit(&raw, limit)?;
+            let clear = open(base_key, &pkt, tag16, tag8)
+                .ok_or_else(|| anyhow!("Resume handshake: invalid base packet"))?;
+            let ctrl: Control = bincode::deserialize(&clear.data)?;
+            let (token_id, client_nonce, ts_ms) = match ctrl {
+                Control::ResumeHello {
+                    token_id,
+                    client_nonce,
+                    ts_ms,
+                } => (token_id, client_nonce, ts_ms),
+                _ => bail!("Unexpected resume hello"),
+            };
+            if token_id != resume.token_id {
+                bail!("Resume token mismatch");
+            }
+            if client_nonce[0] != 0x01 {
+                bail!("Resume client nonce invalid");
+            }
+            let now = crypto::now_ms();
+            if ts_ms > now.saturating_add(RESUME_MAX_SKEW_MS)
+                || now.saturating_sub(ts_ms) > RESUME_MAX_SKEW_MS
+            {
+                bail!("Resume hello expired");
+            }
+            let mut server_nonce = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut server_nonce);
+            server_nonce[0] = 0x02;
+            let ctrl = Control::ResumeAccept {
+                token_id,
+                server_nonce,
+            };
+            let payload_bytes = bincode::serialize(&ctrl)?;
+            let (nonce, seq) = nonce_seq.next_nonce_and_seq()?;
+            let clear = ClearPayload {
+                ts_ms: crypto::now_ms(),
+                seq,
+                data: payload_bytes,
+            };
+            let pkt = seal_with_nonce(base_key, tag16, tag8, &clear, &nonce)?;
+            let raw_bytes = crypto::serialize_cipher_packet(&pkt)?;
+            send(raw_bytes).await?;
+
+            Ok(derive_resume_session_key(
+                &resume.resume_secret,
+                &client_nonce,
+                &server_nonce,
+            )?)
+        }
+    }
+}
+
+pub async fn run_resume_or_noise(
+    role: NoiseRole,
+    conn: &Connection,
+    base_key: &[u8; 32],
+    tag16: u16,
+    tag8: u8,
+    resume: &ResumeParams,
+) -> Result<([u8; 32], bool)> {
+    if resume.is_expired() {
+        let key = run_noise_upgrade(role, conn, base_key, tag16, tag8).await?;
+        return Ok((key, false));
+    }
+    match timeout(
+        Duration::from_millis(RESUME_TIMEOUT_MS),
+        run_resume_upgrade(role, conn, base_key, tag16, tag8, resume),
+    )
+    .await
+    {
+        Ok(Ok(k)) => Ok((k, true)),
+        Ok(Err(e)) => {
+            tracing::warn!("Resume failed, falling back to Noise: {:?}", e);
+            let key = run_noise_upgrade(role, conn, base_key, tag16, tag8).await?;
+            Ok((key, false))
+        }
+        Err(_) => {
+            tracing::warn!("Resume timeout, falling back to Noise");
+            let key = run_noise_upgrade(role, conn, base_key, tag16, tag8).await?;
+            Ok((key, false))
+        }
+    }
+}
+
+fn derive_resume_session_key(
+    resume_secret: &[u8; 32],
+    client_nonce: &[u8; 32],
+    server_nonce: &[u8; 32],
+) -> Result<[u8; 32]> {
+    let mut salt = Vec::with_capacity(64);
+    salt.extend_from_slice(client_nonce);
+    salt.extend_from_slice(server_nonce);
+    let hk = Hkdf::<Sha256>::new(Some(&salt), resume_secret);
+    let mut out = [0u8; 32];
+    hk.expand(b"handshacke-resume-v1", &mut out)
+        .map_err(|e| anyhow!("HKDF expand failed: {:?}", e))?;
+    Ok(out)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -303,7 +577,7 @@ where
         NoiseRole::Initiator => 0x01,
         NoiseRole::Responder => 0x02,
     };
-    let mut nonce_seq = NonceSeq::new_boot_random(base_key, NONCE_DOMAIN_NOISE, role_byte);
+    let mut nonce_seq = NonceSeq::new_boot_random(base_key, NONCE_DOMAIN_NOISE, role_byte)?;
 
     loop {
         if noise.is_handshake_finished() {
@@ -340,9 +614,8 @@ where
             }
 
             let pkt = deserialize_cipher_packet_with_limit(&raw_bytes, limit)?;
-            let clear = open(base_key, &pkt, tag16, tag8).ok_or_else(|| {
-                anyhow!("Noise handshake: Invalid base packet tag or decryption failed")
-            })?;
+            let clear = open(base_key, &pkt, tag16, tag8)
+                .ok_or_else(|| anyhow!("Noise handshake: invalid base packet"))?;
 
             let ctrl: Control = bincode::deserialize(&clear.data)?;
 

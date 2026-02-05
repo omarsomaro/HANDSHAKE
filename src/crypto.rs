@@ -14,6 +14,7 @@ pub const NONCE_DOMAIN_NOISE: u8 = 0x01;
 pub const NONCE_DOMAIN_APP: u8 = 0x02;
 pub const NONCE_DOMAIN_ASSIST: u8 = 0x03;
 pub const NONCE_DOMAIN_API: u8 = 0x04;
+pub const NONCE_DOMAIN_RESUME: u8 = 0x05;
 
 static BOOT_NONCE_SALT: OnceLock<[u8; 32]> = OnceLock::new();
 
@@ -32,7 +33,12 @@ pub struct NonceSeq {
 }
 
 impl NonceSeq {
-    fn new_with_salt(key_enc: &[u8; 32], domain: u8, role: u8, salt: Option<&[u8; 32]>) -> Self {
+    fn new_with_salt(
+        key_enc: &[u8; 32],
+        domain: u8,
+        role: u8,
+        salt: Option<&[u8; 32]>,
+    ) -> anyhow::Result<Self> {
         let hk = Hkdf::<Sha256>::new(Some(b"hs/xchacha20/nonce-prefix/v1"), key_enc);
         let mut prefix = [0u8; 16];
         let info = if let Some(salt) = salt {
@@ -40,18 +46,19 @@ impl NonceSeq {
         } else {
             vec![domain, role]
         };
-        hk.expand(&info, &mut prefix).expect("HKDF expand failed");
-        Self { prefix, ctr: 0 }
+        hk.expand(&info, &mut prefix)
+            .map_err(|e| anyhow::anyhow!("HKDF expand failed: {:?}", e))?;
+        Ok(Self { prefix, ctr: 0 })
     }
 
-    pub fn new(key_enc: &[u8; 32], domain: u8, role: u8) -> Self {
+    pub fn new(key_enc: &[u8; 32], domain: u8, role: u8) -> anyhow::Result<Self> {
         // Deterministic prefix: safe only when key changes per session.
         Self::new_with_salt(key_enc, domain, role, None)
     }
 
     /// Use a boot-random salt to prevent nonce reuse after restarts.
     /// Required when the key may repeat across process restarts.
-    pub fn new_boot_random(key_enc: &[u8; 32], domain: u8, role: u8) -> Self {
+    pub fn new_boot_random(key_enc: &[u8; 32], domain: u8, role: u8) -> anyhow::Result<Self> {
         let salt = boot_nonce_salt();
         Self::new_with_salt(key_enc, domain, role, Some(&salt))
     }
@@ -83,6 +90,114 @@ pub struct ClearPayload {
     pub ts_ms: u64,
     pub seq: u64,
     pub data: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct KeyRotationPolicy {
+    pub interval_ms: u64,
+    pub max_messages: u64,
+}
+
+impl KeyRotationPolicy {
+    pub fn disabled() -> Self {
+        Self {
+            interval_ms: 0,
+            max_messages: 0,
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.interval_ms > 0 || self.max_messages > 0
+    }
+}
+
+#[derive(Clone)]
+pub struct SessionKeyState {
+    current_key: [u8; 32],
+    previous_key: Option<[u8; 32]>,
+    prev_expires_at_ms: Option<u64>,
+    tag16: u16,
+    tag8: u8,
+    grace_ms: u64,
+    last_ack_id: Option<u64>,
+}
+
+impl SessionKeyState {
+    pub fn new(current_key: [u8; 32], tag16: u16, tag8: u8, grace_ms: u64) -> Self {
+        Self {
+            current_key,
+            previous_key: None,
+            prev_expires_at_ms: None,
+            tag16,
+            tag8,
+            grace_ms,
+            last_ack_id: None,
+        }
+    }
+
+    pub fn tag16(&self) -> u16 {
+        self.tag16
+    }
+
+    pub fn tag8(&self) -> u8 {
+        self.tag8
+    }
+
+    pub fn current_key(&self) -> &[u8; 32] {
+        &self.current_key
+    }
+
+    pub fn rotate_to(&mut self, new_key: [u8; 32]) {
+        self.previous_key = Some(self.current_key);
+        self.prev_expires_at_ms = Some(now_ms().saturating_add(self.grace_ms));
+        self.current_key = new_key;
+        self.last_ack_id = None;
+    }
+
+    pub fn open_packet(&mut self, pkt: &CipherPacket) -> Option<ClearPayload> {
+        self.prune_expired();
+        if let Some(clear) = open(&self.current_key, pkt, self.tag16, self.tag8) {
+            return Some(clear);
+        }
+        if let Some(prev) = &self.previous_key {
+            if self
+                .prev_expires_at_ms
+                .map(|ts| now_ms() <= ts)
+                .unwrap_or(false)
+            {
+                return open(prev, pkt, self.tag16, self.tag8);
+            }
+        }
+        None
+    }
+
+    pub fn prune_expired(&mut self) {
+        if let Some(ts) = self.prev_expires_at_ms {
+            if now_ms() > ts {
+                self.previous_key = None;
+                self.prev_expires_at_ms = None;
+            }
+        }
+    }
+
+    pub fn set_ack_id(&mut self, ack_id: u64) {
+        self.last_ack_id = Some(ack_id);
+    }
+
+    pub fn last_ack_id(&self) -> Option<u64> {
+        self.last_ack_id
+    }
+}
+
+pub fn key_id_from_key(key: &[u8; 32]) -> u64 {
+    use blake3::Hasher;
+    let mut hasher = Hasher::new();
+    hasher.update(key);
+    let hash = hasher.finalize();
+    let bytes = hash.as_bytes();
+    u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ])
 }
 
 // Wire format notes (release):
@@ -504,8 +619,8 @@ mod tests {
     #[test]
     fn test_nonce_seq_role_separation() {
         let key = [9u8; 32];
-        let mut ns_a = NonceSeq::new(&key, NONCE_DOMAIN_APP, 0x01);
-        let mut ns_b = NonceSeq::new(&key, NONCE_DOMAIN_APP, 0x02);
+        let mut ns_a = NonceSeq::new(&key, NONCE_DOMAIN_APP, 0x01).unwrap();
+        let mut ns_b = NonceSeq::new(&key, NONCE_DOMAIN_APP, 0x02).unwrap();
         let nonce_a = ns_a.next_nonce().unwrap();
         let nonce_b = ns_b.next_nonce().unwrap();
         assert_ne!(&nonce_a[..16], &nonce_b[..16]);
@@ -514,8 +629,8 @@ mod tests {
     #[test]
     fn test_nonce_seq_domain_separation() {
         let key = [9u8; 32];
-        let mut ns_noise = NonceSeq::new(&key, NONCE_DOMAIN_NOISE, 0x01);
-        let mut ns_app = NonceSeq::new(&key, NONCE_DOMAIN_APP, 0x01);
+        let mut ns_noise = NonceSeq::new(&key, NONCE_DOMAIN_NOISE, 0x01).unwrap();
+        let mut ns_app = NonceSeq::new(&key, NONCE_DOMAIN_APP, 0x01).unwrap();
         let nonce_noise = ns_noise.next_nonce().unwrap();
         let nonce_app = ns_app.next_nonce().unwrap();
         assert_ne!(&nonce_noise[..16], &nonce_app[..16]);
@@ -524,7 +639,7 @@ mod tests {
     #[test]
     fn test_nonce_seq_monotonic_and_unique() {
         let key = [3u8; 32];
-        let mut ns = NonceSeq::new(&key, NONCE_DOMAIN_APP, 0x01);
+        let mut ns = NonceSeq::new(&key, NONCE_DOMAIN_APP, 0x01).unwrap();
 
         let (nonce1, seq1) = ns.next_nonce_and_seq().unwrap();
         let (nonce2, seq2) = ns.next_nonce_and_seq().unwrap();
@@ -544,8 +659,10 @@ mod tests {
         let key = [9u8; 32];
         let salt1 = [0x11u8; 32];
         let salt2 = [0x22u8; 32];
-        let mut ns1 = NonceSeq::new_with_salt(&key, NONCE_DOMAIN_NOISE, 0x01, Some(&salt1));
-        let mut ns2 = NonceSeq::new_with_salt(&key, NONCE_DOMAIN_NOISE, 0x01, Some(&salt2));
+        let mut ns1 =
+            NonceSeq::new_with_salt(&key, NONCE_DOMAIN_NOISE, 0x01, Some(&salt1)).unwrap();
+        let mut ns2 =
+            NonceSeq::new_with_salt(&key, NONCE_DOMAIN_NOISE, 0x01, Some(&salt2)).unwrap();
         let (n1, _) = ns1.next_nonce_and_seq().unwrap();
         let (n2, _) = ns2.next_nonce_and_seq().unwrap();
         assert_ne!(n1[..16], n2[..16]);
@@ -554,8 +671,8 @@ mod tests {
     #[test]
     fn test_nonce_boot_random_prefix_stable_in_process() {
         let key = [7u8; 32];
-        let mut ns1 = NonceSeq::new_boot_random(&key, NONCE_DOMAIN_NOISE, 0x02);
-        let mut ns2 = NonceSeq::new_boot_random(&key, NONCE_DOMAIN_NOISE, 0x02);
+        let mut ns1 = NonceSeq::new_boot_random(&key, NONCE_DOMAIN_NOISE, 0x02).unwrap();
+        let mut ns2 = NonceSeq::new_boot_random(&key, NONCE_DOMAIN_NOISE, 0x02).unwrap();
         let (n1, _) = ns1.next_nonce_and_seq().unwrap();
         let (n2, _) = ns2.next_nonce_and_seq().unwrap();
         assert_eq!(n1[..16], n2[..16]);

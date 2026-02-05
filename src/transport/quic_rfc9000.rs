@@ -174,7 +174,7 @@ mod imp {
         }
 
         pub fn peer_addr(&self) -> SocketAddr {
-            "0.0.0.0:0".parse().unwrap()
+            SocketAddr::from(([0, 0, 0, 0], 0))
         }
 
         pub fn local_addr(&self) -> Result<SocketAddr> {

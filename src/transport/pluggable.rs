@@ -20,7 +20,7 @@ pub mod quic_mimic;
 pub mod real_tls;
 pub mod ws_mimic;
 pub use mimicry::{create_protocol, list_protocols, ProtocolMimicry};
-pub use real_tls::RealTlsChannel;
+pub use real_tls::{spki_hashes_base64_from_pem, spki_hashes_from_pem, RealTlsChannel};
 
 /// DPI evasion modes
 #[derive(Debug, Clone, PartialEq)]
@@ -230,20 +230,18 @@ pub struct ProtocolMimicChannel {
 #[async_trait::async_trait]
 impl TransportChannel for ProtocolMimicChannel {
     async fn read_message(&mut self) -> Result<Vec<u8>> {
-        let mut len_buf = [0u8; 4];
-        self.stream.read_exact(&mut len_buf).await?;
-        let len = u32::from_be_bytes(len_buf) as usize;
-
-        let mut msg = vec![0u8; len];
-        self.stream.read_exact(&mut msg).await?;
-        Ok(msg)
+        if self.buffer.is_empty() {
+            self.buffer.resize(64 * 1024, 0u8);
+        }
+        let n = self
+            .protocol
+            .recv(&mut self.stream, &mut self.buffer)
+            .await?;
+        Ok(self.buffer[..n].to_vec())
     }
 
     async fn write_message(&mut self, data: &[u8]) -> Result<()> {
-        let len = data.len() as u32;
-        self.stream.write_all(&len.to_be_bytes()).await?;
-        self.stream.write_all(data).await?;
-        self.stream.flush().await?;
+        self.protocol.send(&mut self.stream, data).await?;
         Ok(())
     }
 }

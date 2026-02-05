@@ -13,6 +13,7 @@ pub mod nat_detection;
 pub mod pluggable;
 pub mod quic_rfc9000;
 pub mod stealth;
+pub mod stun;
 pub mod tasks;
 pub mod tcp_hole_punch;
 pub mod wan;
@@ -27,11 +28,15 @@ pub use wan::wan_tor;
 use crate::config::{Config, WanMode, UDP_MAX_PACKET_SIZE, WAN_ASSIST_GLOBAL_TIMEOUT_SECS};
 use crate::derive::RendezvousParams;
 use crate::offer::{OfferPayload, RoleHint};
+use crate::resume::ResumeParams;
 use crate::security::early_drop_packet;
 use crate::session_noise::NoiseRole;
+use crate::transport::nat_detection::{detect_nat_type, NatDetector, TransportKind};
+use crate::transport::stun::StunClient;
 use anyhow::Result;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex as TokioMutex;
@@ -56,6 +61,12 @@ pub enum Connection {
         reader: Arc<TokioMutex<OwnedReadHalf>>,
         writer: Arc<TokioMutex<OwnedWriteHalf>>,
     },
+    /// WAN via direct TCP stream (framed)
+    WanTcpStream {
+        reader: Arc<TokioMutex<OwnedReadHalf>>,
+        writer: Arc<TokioMutex<OwnedWriteHalf>>,
+        peer: SocketAddr,
+    },
     /// QUIC RFC9000 stream (framed)
     Quic(Arc<crate::transport::quic_rfc9000::QuinnTransport>),
     /// WebRTC DataChannel (message-based)
@@ -69,6 +80,7 @@ impl Connection {
         match self {
             Connection::Lan(sock, _) => Some(sock.clone()),
             Connection::Wan(sock, _) => Some(sock.clone()),
+            Connection::WanTcpStream { .. } => None,
             Connection::WanTorStream { .. } => None,
             Connection::Quic(_) => None,
             Connection::WebRtc(_) => None,
@@ -84,7 +96,10 @@ impl Connection {
     pub fn is_stream(&self) -> bool {
         matches!(
             self,
-            Connection::WanTorStream { .. } | Connection::Quic(_) | Connection::WebRtc(_)
+            Connection::WanTorStream { .. }
+                | Connection::WanTcpStream { .. }
+                | Connection::Quic(_)
+                | Connection::WebRtc(_)
         )
     }
 
@@ -101,6 +116,7 @@ impl Connection {
             Connection::Lan(_, addr) => Some(*addr),
             Connection::Wan(_, addr) => Some(*addr),
             Connection::WanTorStream { .. } => None,
+            Connection::WanTcpStream { peer, .. } => Some(*peer),
             Connection::Quic(quic) => Some(quic.peer_addr()),
             Connection::WebRtc(_) => None,
         }
@@ -111,63 +127,119 @@ impl Connection {
 ///
 /// For WAN mode, uses config to determine Direct vs Tor transport.
 pub async fn establish_connection(p: &RendezvousParams, cfg: &Config) -> Result<Connection> {
-    // 1. LAN
-    if let Ok((sock, peer_addr)) = lan::try_lan_broadcast(p.port).await {
-        tracing::info!("LAN mode active on port: {}", p.port);
-        return Ok(Connection::Lan(Arc::new(sock), peer_addr));
-    }
-
-    // 2. WAN Direct
-    if cfg.wan_mode != WanMode::Tor {
-        match wan::wan_direct::try_direct_port_forward(p.port).await {
-            Ok((sock, ext_addr)) => {
-                tracing::info!("WAN Direct mode active. Port forwarded to {}", ext_addr);
-                return Ok(Connection::Wan(Arc::new(sock), ext_addr));
-            }
-            Err(e) => tracing::warn!("WAN Direct failed: {}", e),
-        }
-    }
-
-    // 3. WAN ASSIST (max 2 relay, 1 tentativo, 5s totali)
-    if !cfg.assist_relays.is_empty() {
-        let assist_start = tokio::time::Instant::now();
-        let mut attempts = 0;
-
-        for relay in cfg.assist_relays.iter().take(2) {
-            if assist_start.elapsed() > Duration::from_secs(WAN_ASSIST_GLOBAL_TIMEOUT_SECS) {
-                tracing::warn!("WAN Assist: global timeout exceeded");
-                break;
-            }
-
-            attempts += 1;
-            match timeout(
-                Duration::from_secs(2),
-                wan_assist::try_assisted_punch(p, std::slice::from_ref(relay), cfg),
-            )
-            .await
-            {
-                Ok(Ok(conn)) => {
-                    tracing::info!("WAN Assist: success after {} attempts", attempts);
-                    return Ok(conn);
-                }
-                Ok(Err(e)) => tracing::warn!("Relay {} failed: {}", relay, e),
-                Err(_) => tracing::warn!("Relay {} timeout", relay),
-            }
-        }
-        tracing::warn!(
-            "WAN Assist: all {} attempts failed, falling back to Tor",
-            attempts
-        );
-    }
-
-    // 4. Tor fallback
-    match wan::try_tor_mode(cfg).await {
-        Ok(wan_conn) => Ok(connection_from_wan(wan_conn).await?),
+    // NAT strategy selection (uses cached detection when available).
+    // NOTE: Requires STUN servers configured via config.nat_detection_servers.
+    let nat_type = match detect_nat_type().await {
+        Ok(nt) => nt,
         Err(e) => {
-            tracing::warn!("Tor failed: {}", e);
-            anyhow::bail!("Connection failed: no reachable transport found (LAN/WAN failed)")
+            tracing::warn!("NAT detection failed, using Unknown strategy: {}", e);
+            crate::transport::nat_detection::NatType::Unknown
+        }
+    };
+    tracing::info!("NAT type detected: {}", nat_type);
+
+    let mut strategy = NatDetector::select_strategy(nat_type);
+    // Fast-path: Symmetric NAT (or Symmetric+Firewall) should skip direct paths.
+    if matches!(
+        nat_type,
+        crate::transport::nat_detection::NatType::Symmetric
+            | crate::transport::nat_detection::NatType::SymetricFirewall
+    ) {
+        tracing::info!("nat=symmetric -> skipping direct transports (stun/upnp)");
+        for step in strategy.iter_mut() {
+            match step.kind {
+                TransportKind::Upnp | TransportKind::Stun => {
+                    step.should_skip = true;
+                }
+                TransportKind::Relay => step.priority = step.priority.max(95),
+                TransportKind::Tor => step.priority = step.priority.max(90),
+                _ => {}
+            }
         }
     }
+    strategy.sort_by(|a, b| b.priority.cmp(&a.priority));
+
+    for step in strategy {
+        if step.should_skip {
+            tracing::debug!("Skipping transport {:?} due to NAT strategy", step.kind);
+            continue;
+        }
+
+        match step.kind {
+            TransportKind::Lan => {
+                if let Ok((sock, peer_addr)) = lan::try_lan_broadcast(p.port).await {
+                    tracing::info!("LAN mode active on port: {}", p.port);
+                    return Ok(Connection::Lan(Arc::new(sock), peer_addr));
+                }
+            }
+            TransportKind::Upnp => {
+                if cfg.wan_mode != WanMode::Tor {
+                    match wan::wan_direct::try_direct_port_forward(p.port).await {
+                        Ok((sock, ext_addr)) => {
+                            tracing::info!(
+                                "WAN Direct mode active. Port forwarded to {}",
+                                ext_addr
+                            );
+                            return Ok(Connection::Wan(Arc::new(sock), ext_addr));
+                        }
+                        Err(e) => tracing::warn!("WAN Direct failed: {}", e),
+                    }
+                }
+            }
+            TransportKind::Stun => {
+                // Placeholder: direct STUN punching uses same WAN direct path for now.
+                // Replace with real STUN-based hole punch when available.
+                if cfg.wan_mode != WanMode::Tor {
+                    match wan::wan_direct::try_direct_port_forward(p.port).await {
+                        Ok((sock, ext_addr)) => {
+                            tracing::info!("STUN path active. Port forwarded to {}", ext_addr);
+                            return Ok(Connection::Wan(Arc::new(sock), ext_addr));
+                        }
+                        Err(e) => tracing::warn!("STUN path failed: {}", e),
+                    }
+                }
+            }
+            TransportKind::Relay => {
+                if !cfg.assist_relays.is_empty() {
+                    let assist_start = tokio::time::Instant::now();
+                    let mut attempts = 0;
+
+                    for relay in cfg.assist_relays.iter().take(2) {
+                        if assist_start.elapsed()
+                            > Duration::from_secs(WAN_ASSIST_GLOBAL_TIMEOUT_SECS)
+                        {
+                            tracing::warn!("WAN Assist: global timeout exceeded");
+                            break;
+                        }
+
+                        attempts += 1;
+                        match timeout(
+                            Duration::from_secs(2),
+                            wan_assist::try_assisted_punch(p, std::slice::from_ref(relay), cfg),
+                        )
+                        .await
+                        {
+                            Ok(Ok(conn)) => {
+                                tracing::info!("WAN Assist: success after {} attempts", attempts);
+                                return Ok(conn);
+                            }
+                            Ok(Err(e)) => tracing::warn!("Relay {} failed: {}", relay, e),
+                            Err(_) => tracing::warn!("Relay {} timeout", relay),
+                        }
+                    }
+                    tracing::warn!("WAN Assist: all {} attempts failed, falling back", attempts);
+                } else {
+                    tracing::debug!("WAN Assist skipped: no relays configured");
+                }
+            }
+            TransportKind::Tor => match wan::try_tor_mode(cfg).await {
+                Ok(wan_conn) => return Ok(connection_from_wan(wan_conn).await?),
+                Err(e) => tracing::warn!("Tor failed: {}", e),
+            },
+        }
+    }
+
+    anyhow::bail!("Connection failed: no reachable transport found (NAT strategy exhausted)")
 }
 
 async fn connection_from_wan(wan_conn: WanConnection) -> Result<Connection> {
@@ -219,7 +291,12 @@ pub async fn connect_to(
     }
 
     let peer: SocketAddr = target.parse()?;
-    let sock = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0))).await?;
+    let bind_addr = if peer.is_ipv6() {
+        SocketAddr::from(([0u16; 8], 0))
+    } else {
+        SocketAddr::from(([0, 0, 0, 0], 0))
+    };
+    let sock = UdpSocket::bind(bind_addr).await?;
     sock.connect(peer).await?;
 
     let probe = build_probe_packet(params.tag16);
@@ -237,6 +314,7 @@ pub async fn connect_to(
     let mut buf = vec![0u8; 1024];
     let timeout_ms = cfg.wan_connect_timeout_ms.clamp(1, 10000); // Cap timeout to prevent resource exhaustion
 
+    let mut udp_blocked = false;
     match timeout(Duration::from_millis(timeout_ms), sock.recv_from(&mut buf)).await {
         Ok(Ok((n, from))) if from == peer && (8..=UDP_MAX_PACKET_SIZE).contains(&n) => {
             // Additional validation: ensure response is reasonable size
@@ -256,12 +334,59 @@ pub async fn connect_to(
                 from,
                 peer
             );
+            udp_blocked = true;
         }
         Ok(Err(e)) => {
             tracing::debug!("UDP receive error: {}", e);
+            udp_blocked = true;
         }
         Err(_) => {
             tracing::debug!("UDP receive timeout");
+            udp_blocked = true;
+        }
+    }
+
+    if udp_blocked {
+        tracing::info!("udp_blocked -> trying TCP hole punch");
+
+        let local = if peer.is_ipv6() {
+            SocketAddr::from(([0u16; 8], params.port))
+        } else {
+            SocketAddr::from(([0, 0, 0, 0], params.port))
+        };
+
+        let tcp_result = match TcpHolePunch::punch(local, peer).await {
+            Ok(stream) => Ok(stream),
+            Err(e) => {
+                tracing::warn!(
+                    "TCP hole punch failed on port {} ({}), retrying ephemeral port",
+                    params.port,
+                    e
+                );
+                let local_ephemeral = if peer.is_ipv6() {
+                    SocketAddr::from(([0u16; 8], 0))
+                } else {
+                    SocketAddr::from(([0, 0, 0, 0], 0))
+                };
+                TcpHolePunch::punch(local_ephemeral, peer).await
+            }
+        };
+
+        match tcp_result {
+            Ok(stream) => {
+                let (reader, writer) = stream.into_split();
+                return Ok(Connection::WanTcpStream {
+                    reader: Arc::new(TokioMutex::new(reader)),
+                    writer: Arc::new(TokioMutex::new(writer)),
+                    peer,
+                });
+            }
+            Err(e) => {
+                tracing::warn!("tcp failed -> giving up ({})", e);
+                tracing::warn!(
+                    "Direct connect failed behind restrictive NAT/firewall. Suggested: use QR + Tor relay for reliable rendezvous."
+                );
+            }
         }
     }
 
@@ -283,12 +408,22 @@ pub struct OfferConnectResult {
     pub session_key: [u8; 32],
     pub mode: String,
     pub peer: Option<String>,
+    pub resume_used: Option<bool>,
 }
 
 pub async fn establish_connection_from_offer(
     offer: &OfferPayload,
     cfg: &Config,
     local_role: RoleHint,
+) -> Result<OfferConnectResult> {
+    establish_connection_from_offer_with_resume(offer, cfg, local_role, None).await
+}
+
+pub async fn establish_connection_from_offer_with_resume(
+    offer: &OfferPayload,
+    cfg: &Config,
+    local_role: RoleHint,
+    resume: Option<ResumeParams>,
 ) -> Result<OfferConnectResult> {
     let noise_role = match local_role {
         RoleHint::Host => NoiseRole::Responder,
@@ -301,9 +436,93 @@ pub async fn establish_connection_from_offer(
         key_enc: offer.rendezvous.key_enc,
         key_mac: [0u8; 32],
         tag16: offer.rendezvous.tag16,
-        tag8: crate::derive::derive_tag8_from_key(&offer.rendezvous.key_enc),
+        tag8: crate::derive::derive_tag8_from_key(&offer.rendezvous.key_enc)?,
         version: crate::offer::OFFER_VERSION,
     };
+
+    // STUN hole punching (QR/offer aware). Requires peer public addr in offer.
+    if let Some(peer_public) = offer.stun_public_addr {
+        if let Ok(stun) = StunClient::new(cfg.nat_detection_servers.clone()) {
+            match stun.discover(params.port).await {
+                Ok(discovery) => {
+                    tracing::info!(
+                        "STUN discovery: public={} (via {}), nat_type={}",
+                        discovery.public_addr,
+                        discovery.server_used,
+                        discovery.nat_type
+                    );
+
+                    // Coordinated rendezvous window using offer timestamp (best-effort sync)
+                    let rendezvous_window_ms = 30_000u64;
+                    let now_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let adjusted_now = if let Some(offset) = offer.ntp_offset {
+                        (now_ms as i64 + offset) as u64
+                    } else {
+                        now_ms
+                    };
+                    let rendezvous_at_ms = offer.timestamp.saturating_add(rendezvous_window_ms);
+                    if rendezvous_at_ms > adjusted_now {
+                        let sleep_ms = rendezvous_at_ms.saturating_sub(adjusted_now);
+                        tracing::info!(
+                            "STUN hole punch rendezvous at {} (in {}ms)",
+                            rendezvous_at_ms,
+                            sleep_ms
+                        );
+                        tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+                    }
+
+                    if let Ok(sock) = stun
+                        .hole_punch_with_socket(discovery.socket.clone(), peer_public)
+                        .await
+                    {
+                        tracing::info!("STUN hole punch successful with {}", peer_public);
+                        let conn = Connection::Wan(sock, peer_public);
+                        let mode = "stun".to_string();
+                        let peer = Some(peer_public.to_string());
+                        let tag8 = crate::derive::derive_tag8_from_key(&offer.rendezvous.key_enc)?;
+                        let (session_key, resume_used) = match resume {
+                            Some(ref resume) => {
+                                crate::session_noise::run_resume_or_noise(
+                                    noise_role,
+                                    &conn,
+                                    &offer.rendezvous.key_enc,
+                                    offer.rendezvous.tag16,
+                                    tag8,
+                                    resume,
+                                )
+                                .await?
+                            }
+                            None => (
+                                crate::session_noise::run_noise_upgrade(
+                                    noise_role,
+                                    &conn,
+                                    &offer.rendezvous.key_enc,
+                                    offer.rendezvous.tag16,
+                                    tag8,
+                                )
+                                .await?,
+                                false,
+                            ),
+                        };
+
+                        return Ok(OfferConnectResult {
+                            conn,
+                            session_key,
+                            mode,
+                            peer,
+                            resume_used: resume.map(|_| resume_used),
+                        });
+                    } else {
+                        tracing::warn!("STUN hole punch failed, falling back to ICE");
+                    }
+                }
+                Err(e) => tracing::warn!("STUN discovery failed: {}", e),
+            }
+        }
+    }
 
     let (conn, _peer_addr) = crate::transport::ice::multipath_race_connect(
         offer,
@@ -318,6 +537,7 @@ pub async fn establish_connection_from_offer(
         Connection::Lan(_, _) => "lan",
         Connection::Wan(_, _) => "wan",
         Connection::WanTorStream { .. } => "wan_tor",
+        Connection::WanTcpStream { .. } => "wan_tcp",
         Connection::Quic(_) => "quic",
         Connection::WebRtc(_) => "webrtc",
     }
@@ -326,23 +546,42 @@ pub async fn establish_connection_from_offer(
     let peer = match &conn {
         Connection::Lan(_, addr) | Connection::Wan(_, addr) => Some(addr.to_string()),
         Connection::WanTorStream { .. } => offer.tor_onion_addr()?,
+        Connection::WanTcpStream { peer, .. } => Some(peer.to_string()),
         Connection::Quic(_) => conn.peer_addr().map(|addr| addr.to_string()),
         Connection::WebRtc(_) => None,
     };
 
-    let session_key = crate::session_noise::run_noise_upgrade(
-        noise_role,
-        &conn,
-        &offer.rendezvous.key_enc,
-        offer.rendezvous.tag16,
-        crate::derive::derive_tag8_from_key(&offer.rendezvous.key_enc),
-    )
-    .await?;
+    let tag8 = crate::derive::derive_tag8_from_key(&offer.rendezvous.key_enc)?;
+    let (session_key, resume_used) = match resume {
+        Some(ref resume) => {
+            crate::session_noise::run_resume_or_noise(
+                noise_role,
+                &conn,
+                &offer.rendezvous.key_enc,
+                offer.rendezvous.tag16,
+                tag8,
+                resume,
+            )
+            .await?
+        }
+        None => (
+            crate::session_noise::run_noise_upgrade(
+                noise_role,
+                &conn,
+                &offer.rendezvous.key_enc,
+                offer.rendezvous.tag16,
+                tag8,
+            )
+            .await?,
+            false,
+        ),
+    };
 
     Ok(OfferConnectResult {
         conn,
         session_key,
         mode,
         peer,
+        resume_used: resume.map(|_| resume_used),
     })
 }

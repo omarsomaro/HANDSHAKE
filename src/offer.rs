@@ -20,8 +20,8 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Offer protocol version (breaking v3)
-pub const OFFER_VERSION: u8 = 3;
+/// Offer protocol version (breaking v4)
+pub const OFFER_VERSION: u8 = 4;
 
 /// TTL default: 5 minutes
 pub const DEFAULT_TTL_SECONDS: u64 = 300;
@@ -68,6 +68,7 @@ pub struct OfferPayload {
     pub tor_ephemeral_pk: Option<[u8; 32]>,
     pub tor_endpoint_enc: Option<Vec<u8>>,
     pub rendezvous: RendezvousInfo,
+    pub stun_public_addr: Option<SocketAddr>,
     pub per_ephemeral_salt: Option<[u8; 16]>, // ← Per-port randomization salt
     pub commit: [u8; 32],
     pub timestamp: u64,          // UNIX timestamp in ms for simultaneous open
@@ -120,7 +121,8 @@ impl OfferPayload {
             tor_ephemeral_pk,
             tor_endpoint_enc,
             rendezvous,
-            per_ephemeral_salt: None, // ← Aggiunto
+            per_ephemeral_salt: None, // â† Aggiunto
+            stun_public_addr: None,
             commit: [0u8; 32],
             timestamp,
             ntp_offset: None,
@@ -161,6 +163,8 @@ impl OfferPayload {
         } else {
             mac.update(&[0u8; 16]);
         }
+
+        mac.update(&bincode::serialize(&offer.stun_public_addr)?);
 
         let result = mac.finalize();
         Ok(result.into_bytes().into())

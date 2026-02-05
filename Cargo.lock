@@ -1239,6 +1239,7 @@ dependencies = [
  "webpki-roots 0.26.11",
  "webrtc",
  "x25519-dalek",
+ "x509-parser",
  "zeroize",
 ]
 

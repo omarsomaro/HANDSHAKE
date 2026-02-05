@@ -13,15 +13,21 @@ Latest Version: 0.1.0
 - Zero-discovery P2P (shared passphrase rendezvous)
 - Deterministic parameter derivation (port, keys, tags)
 - Transport cascade: LAN -> WAN (UPnP/NAT-PMP) -> Tor fallback
-- ICE multipath with adaptive transport selection
+- ICE multipath racing (best path wins)
+- STUN discovery + QR/offer enrichment (public endpoint hints)
+- Hybrid QR (resume token + deterministic fallback)
 - Memory-safe crypto: XChaCha20-Poly1305 + HMAC with key zeroization
 - Early-drop filtering + rate limiting (DoS resistance)
 - Replay protection (sliding window)
-- Multi-protocol DPI evasion: Real TLS, WebSocket, QUIC, HTTP/2 mimicry
+- Key rotation with grace window
+- Multi-protocol DPI evasion: Real TLS, WebSocket, HTTP/2/QUIC mimicry (experimental)
 - Optional QUIC (RFC 9000) and WebRTC DataChannel
-- Optional post-quantum hybrid key exchange (feature: pq)
+- Optional post-quantum hybrid key exchange (feature: pq) with classic fallback
 - Desktop GUI (Tauri) with guided connection flows
 - Threat model and security analysis in docs
+- Pluggable transport framework (experimental, requires external infra for some modes)
+- IPv6-first dual-stack support
+- TCP fallback when UDP is blocked (target connect)
 
 ## Installation
 
@@ -114,6 +120,14 @@ Connection Management
 - POST /v1/connect - Establish P2P connection
 - GET /v1/status - Get connection status
 - POST /v1/disconnect - Close connection
+- POST /v1/offer - Generate Offer payload
+- POST /v1/qr/hybrid - Generate Hybrid QR (resume + fallback)
+- POST /v1/phrase/open - Open Tor phrase flow
+- POST /v1/phrase/join - Join Tor phrase flow
+- GET /v1/phrase/status - Phrase status
+- POST /v1/phrase/close - Close phrase flow
+- POST /v1/rendezvous/sync - Relay-assisted rendezvous sync
+- GET /v1/pluggable/check - Pluggable transport status checklist
 
 Messaging
 - GET /v1/recv - SSE stream for incoming messages
@@ -123,6 +137,7 @@ Crypto Operations
 - POST /v1/set_passphrase - Set encryption passphrase
 - POST /v1/seal - Encrypt data to packet
 - POST /v1/open - Decrypt packet to data
+- GET /v1/metrics - In-memory diagnostics (RAM-only)
 
 ## Security
 
@@ -157,10 +172,17 @@ let params = derive_from_passphrase("shared_secret");
 - LAN: UDP broadcast discovery
 - WAN: UPnP/NAT-PMP port forwarding
 - Tor: stream fallback when direct WAN fails
+- STUN: public endpoint discovery and hole punching (QR/offer aware)
+- TCP fallback: when UDP is blocked (target connect)
 
 Optional transports
 - QUIC (RFC 9000): framed stream over UDP
 - WebRTC DataChannel: browser-compatible transport
+
+Pluggable transports (experimental)
+- Real TLS, WebSocket, QUIC, HTTP/2 mimicry
+- External infrastructure required for Real TLS and most mimicry modes
+- See `docs/pluggable_integration.md`
 
 3) Message flow
 ```
@@ -168,13 +190,37 @@ Optional transports
 [Peer] -> Tag Filter -> Rate Limit -> Decrypt -> Replay Check -> Display
 ```
 
+## QR Flows (Why They Matter)
+
+Handshacke uses QR payloads to make rendezvous **fast, explicit, and hard to misconfigure**.  
+The QR is never your passphrase. It is a **time‑limited rendezvous envelope** that carries
+endpoints and parameters so two peers can align quickly.
+
+### Offer QR (endpoint-based)
+- **Purpose**: simple pairing without typing IPs.
+- **Contents**: endpoints + rendezvous params (no passphrase).
+- **Use when**: you want quick pairing and can re-scan if needed.
+
+### Hybrid QR (resume + fallback)
+- **Purpose**: best UX and fastest re-join.
+- **Contents**: resume token + deterministic offer (fallback).
+- **Use when**: you want a stable, repeatable reconnection flow.
+
+### Phrase QR (Tor invite)
+- **Purpose**: privacy-first pairing.
+- **Contents**: Tor invite string only (no passphrase).
+- **Use when**: you want Tor-only rendezvous and privacy.
+
+**Important**: If direct connect fails (NAT/firewall), the most reliable flow is **Hybrid/Offer QR + Tor relay**.
+
 ## Network Compatibility
 
 - LAN: direct UDP broadcast
 - Home networks: UPnP automatic port forwarding
 - Corporate/CGNAT: NAT-PMP fallback
-- Restrictive NATs: Tor fallback and assisted hole punching
-- IPv4/IPv6: dual-stack (IPv4 primary)
+- Restrictive NATs: Symmetric NAT fast-path to relay/Tor
+- UDP blocked: TCP fallback
+- IPv4/IPv6: dual-stack (IPv6-first)
 - Censorship: Tor integration available
 - Interoperability: optional QUIC and WebRTC transports
 

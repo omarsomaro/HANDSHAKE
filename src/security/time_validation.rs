@@ -58,8 +58,11 @@ impl TimeValidator {
                 "Large clock jump detected: {}ms, using monotonic time",
                 time_diff
             );
-            *self.last_good_offset.lock().unwrap() =
-                (actual_system_ms as i64) - (expected_system_ms as i64);
+            let mut guard = self
+                .last_good_offset
+                .lock()
+                .map_err(|_| anyhow::anyhow!("last_good_offset lock poisoned"))?;
+            *guard = (actual_system_ms as i64) - (expected_system_ms as i64);
             return Ok(expected_system_ms);
         }
 

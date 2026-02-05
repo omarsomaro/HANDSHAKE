@@ -26,7 +26,11 @@ impl TcpHolePunch {
         info!("Attempting TCP hole punching {} -> {}", local, remote);
 
         // Create TCP socket with SO_REUSEADDR
-        let socket = TcpSocket::new_v4().context("create TCP socket")?;
+        let socket = if local.is_ipv6() || remote.is_ipv6() {
+            TcpSocket::new_v6().context("create TCP socket v6")?
+        } else {
+            TcpSocket::new_v4().context("create TCP socket v4")?
+        };
 
         // Enable SO_REUSEADDR to allow bind to specific port
         socket.set_reuseaddr(true).context("set SO_REUSEADDR")?;

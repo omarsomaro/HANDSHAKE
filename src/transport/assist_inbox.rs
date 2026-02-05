@@ -147,14 +147,22 @@ impl AssistInbox {
                 self.params.tag16,
                 self.params.tag8,
             )
-            .ok_or_else(|| anyhow::anyhow!("Invalid MAC on assist request"))?;
+            .ok_or_else(|| anyhow::anyhow!("Invalid assist request"))?;
 
             let ctrl: Control = bincode::deserialize(&clear.data)?;
             match ctrl {
                 Control::AssistRequest(req) => {
                     // Verifica MAC (opzionale se C trustato)
-                    let expected_mac =
-                        crate::protocol_assist::compute_assist_mac(&self.params.key_enc, &req);
+                    let expected_mac = match crate::protocol_assist::compute_assist_mac(
+                        &self.params.key_enc,
+                        &req,
+                    ) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            tracing::warn!("Assist inbox: MAC compute failed: {}", e);
+                            continue;
+                        }
+                    };
                     if !bool::from(req.mac.ct_eq(&expected_mac)) {
                         tracing::warn!("Assist inbox: invalid MAC, dropping");
                         continue;

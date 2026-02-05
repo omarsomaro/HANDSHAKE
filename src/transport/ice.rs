@@ -534,18 +534,7 @@ impl IceAgent {
     }
 
     fn get_local_ip_addresses(&self) -> Result<Vec<IpAddr>> {
-        let mut addrs = Vec::new();
-        for iface in if_addrs::get_if_addrs()? {
-            let ip = iface.ip();
-            if ip.is_loopback() {
-                continue;
-            }
-            match ip {
-                IpAddr::V4(_) => addrs.insert(0, ip),
-                IpAddr::V6(_) => addrs.push(ip),
-            }
-        }
-        Ok(addrs)
+        Ok(crate::transport::lan::get_local_ip_addresses()?)
     }
 }
 
@@ -612,6 +601,7 @@ pub async fn establish_connection_from_candidate(
         session_key,
         mode,
         peer: endpoint.addr.map(|a| a.to_string()),
+        resume_used: None,
     })
 }
 
@@ -620,4 +610,5 @@ pub struct OfferConnectResult {
     pub session_key: [u8; 32],
     pub mode: String,
     pub peer: Option<String>,
+    pub resume_used: Option<bool>,
 }

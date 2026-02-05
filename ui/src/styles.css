@@ -337,6 +337,54 @@ input, select, textarea {
   color: var(--ink-2);
 }
 
+.warning-text {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #f1b166;
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  margin-left: 6px;
+  border: 1px solid var(--panel-border);
+}
+
+.badge-ok {
+  color: #04110a;
+  background: var(--ok);
+  border-color: rgba(54, 255, 157, 0.5);
+}
+
+.badge-warn {
+  color: #2a1900;
+  background: #f1b166;
+  border-color: rgba(241, 177, 102, 0.5);
+}
+
+.badge-info {
+  color: #03121b;
+  background: #7fd3ff;
+  border-color: rgba(127, 211, 255, 0.5);
+}
+
+.badge-danger {
+  color: #19050a;
+  background: #ff7a92;
+  border-color: rgba(255, 122, 146, 0.5);
+}
+
+.badge-muted {
+  color: var(--ink-2);
+  background: rgba(125, 247, 178, 0.08);
+  border-color: rgba(0, 255, 154, 0.25);
+}
+
 .checklist {
   margin-top: 10px;
   display: grid;

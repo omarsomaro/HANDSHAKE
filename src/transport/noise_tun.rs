@@ -19,7 +19,7 @@ pub async fn simulate_noise_handshake(port: u16) -> Result<(UdpSocket, SocketAdd
     let i_am_caller = (port & 1) == 1;
 
     // costruiamo i due stati XX
-    let params: snow::params::NoiseParams = NOISE_PARAMS.parse().unwrap();
+    let params: snow::params::NoiseParams = NOISE_PARAMS.parse().context("noise params parse")?;
     let builder = Builder::new(params);
 
     let mut noise_i = builder.build_initiator().context("noise initiator")?;

@@ -109,19 +109,18 @@ impl ProtocolMimicry for Http2Mimic {
         window_update[9..13].copy_from_slice(&(1u32 << 31).to_be_bytes()); // Increment: 2^31
         stream.write_all(&window_update).await?;
 
-        // Read server preface
-        let mut response = vec![0u8; 1024];
-        let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut response))
+        // Read first server frame (should be SETTINGS)
+        let mut header = [0u8; 9];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut header))
             .await
             .context("HTTP/2 preface timeout")??;
-
-        if n < 24 {
-            bail!("Invalid HTTP/2 preface response");
+        let (length, frame_type, _flags, stream_id) = Self::parse_frame_header(&header);
+        if frame_type != 0x04 || stream_id != 0 {
+            bail!("Invalid HTTP/2 server preface: expected SETTINGS");
         }
-
-        // Verify server preface
-        if !response.starts_with(b"PRI * HTTP/2.0") {
-            bail!("Invalid HTTP/2 preface");
+        if length > 0 {
+            let mut payload = vec![0u8; length];
+            stream.read_exact(&mut payload).await?;
         }
 
         self.state = Http2State::Established;

@@ -4,8 +4,10 @@
 //! actual TLS handshakes to evade deep inspection.
 
 use anyhow::{bail, Context, Result};
+use base64::{engine::general_purpose, Engine as _};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, RootCertStore};
+use sha2::Digest;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -13,6 +15,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio_rustls::{client::TlsStream, TlsConnector};
+use x509_parser::prelude::{FromDer, X509Certificate};
+
+use crate::config::Config;
 
 /// Cached certificate chain
 #[derive(Clone)]
@@ -135,6 +140,32 @@ impl RealTlsChannel {
             .await
             .context("TLS handshake with peer")?;
 
+        // Mimicry pinning: verify issuer SPKI plausibility for target domain
+        let cfg = Config::from_env();
+        if let Some((pins, enforce)) = collect_mimicry_pins(&cfg, self.domain.as_ref()) {
+            let (_, conn) = tls_stream.get_ref();
+            let certs: Vec<Vec<u8>> = conn
+                .peer_certificates()
+                .map(|certs| certs.iter().map(|cert| cert.as_ref().to_vec()).collect())
+                .unwrap_or_default();
+
+            if !certs.is_empty() {
+                let matches = match_mimicry_pins(&certs, &pins)?;
+                if !matches {
+                    if enforce {
+                        bail!("RealTLS mimicry pin mismatch for {}", self.domain);
+                    } else {
+                        tracing::warn!(
+                            "RealTLS mimicry pin mismatch for {} (warn-only)",
+                            self.domain
+                        );
+                    }
+                }
+            } else if enforce {
+                bail!("RealTLS mimicry pinning failed: no peer certificates");
+            }
+        }
+
         // Enable TCP_NODELAY after handshake (efficient data transfer)
         let (tcp, _) = tls_stream.get_ref();
         tcp.set_nodelay(true)?;
@@ -148,6 +179,89 @@ impl RealTlsChannel {
         );
         Ok(())
     }
+}
+
+fn collect_mimicry_pins(cfg: &Config, domain: &str) -> Option<(Vec<[u8; 32]>, bool)> {
+    if cfg.realtls_mimic_pins.is_empty() {
+        return None;
+    }
+    let mut hashes = Vec::new();
+    let mut enforce = false;
+    for pin in cfg
+        .realtls_mimic_pins
+        .iter()
+        .filter(|p| p.target_domain == domain)
+    {
+        hashes.extend_from_slice(&pin.issuer_spki_hashes);
+        enforce |= pin.enforce;
+    }
+    if hashes.is_empty() {
+        None
+    } else {
+        Some((hashes, enforce))
+    }
+}
+
+fn match_mimicry_pins(cert_chain: &[Vec<u8>], pins: &[[u8; 32]]) -> Result<bool> {
+    // Prefer issuer/intermediate certs; fallback to leaf if chain missing.
+    let mut hashes = Vec::new();
+    if cert_chain.len() > 1 {
+        for cert in &cert_chain[1..] {
+            if let Ok(h) = spki_hash_from_cert(cert) {
+                hashes.push(h);
+            }
+        }
+    } else if let Some(leaf) = cert_chain.first() {
+        if let Ok(h) = spki_hash_from_cert(leaf) {
+            hashes.push(h);
+        }
+    }
+    if hashes.is_empty() {
+        return Ok(false);
+    }
+    for h in hashes {
+        if pins.iter().any(|p| p == &h) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn spki_hash_from_cert(cert_der: &[u8]) -> Result<[u8; 32]> {
+    let (_, cert) =
+        X509Certificate::from_der(cert_der).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let spki = cert.tbs_certificate.subject_pki.raw;
+    let digest = sha2::Sha256::digest(spki);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    Ok(out)
+}
+
+/// Helper: compute SPKI SHA256 hashes from PEM-encoded certificate bundle.
+pub fn spki_hashes_from_pem(pem: &str) -> Result<Vec<[u8; 32]>> {
+    let mut out = Vec::new();
+    let mut reader = std::io::Cursor::new(pem.as_bytes());
+    let certs: Vec<_> = rustls_pemfile::certs(&mut reader)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| anyhow::anyhow!("PEM parse failed: {:?}", e))?;
+    for cert in certs {
+        let h = spki_hash_from_cert(cert.as_ref())?;
+        out.push(h);
+    }
+    if out.is_empty() {
+        bail!("No certificates found in PEM");
+    }
+    Ok(out)
+}
+
+/// Helper: compute base64-encoded SPKI SHA256 hashes from PEM bundle.
+pub fn spki_hashes_base64_from_pem(pem: &str) -> Result<Vec<String>> {
+    let hashes = spki_hashes_from_pem(pem)?;
+    let mut out = Vec::with_capacity(hashes.len());
+    for h in hashes {
+        out.push(general_purpose::STANDARD.encode(h));
+    }
+    Ok(out)
 }
 
 // Implement TransportChannel trait

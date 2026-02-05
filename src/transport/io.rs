@@ -36,7 +36,7 @@ impl TransportIo for ConnectionIo {
     fn rate_limit_addr(&self) -> std::net::SocketAddr {
         self.conn
             .peer_addr()
-            .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap())
+            .unwrap_or_else(|| std::net::SocketAddr::from(([0, 0, 0, 0], 0)))
     }
 
     fn send<'a>(&'a self, data: Vec<u8>) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
@@ -47,6 +47,10 @@ impl TransportIo for ConnectionIo {
                     sock.send_to(&data, addr).await?;
                 }
                 Connection::WanTorStream { writer, .. } => {
+                    let mut guard = writer.lock().await;
+                    crate::transport::framing::write_frame(&mut *guard, &data).await?;
+                }
+                Connection::WanTcpStream { writer, .. } => {
                     let mut guard = writer.lock().await;
                     crate::transport::framing::write_frame(&mut *guard, &data).await?;
                 }
@@ -71,6 +75,10 @@ impl TransportIo for ConnectionIo {
                     Ok(buf[..n].to_vec())
                 }
                 Connection::WanTorStream { reader, .. } => {
+                    let mut guard = reader.lock().await;
+                    crate::transport::framing::read_frame(&mut *guard).await
+                }
+                Connection::WanTcpStream { reader, .. } => {
                     let mut guard = reader.lock().await;
                     crate::transport::framing::read_frame(&mut *guard).await
                 }

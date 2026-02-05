@@ -93,9 +93,8 @@ impl IcmpHolePunch {
         match Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4)) {
             Ok(socket) => {
                 // Bind to any interface
-                socket
-                    .bind(&"0.0.0.0:0".parse::<SocketAddrV4>().unwrap().into())
-                    .context("bind ICMP socket")?;
+                let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
+                socket.bind(&bind_addr.into()).context("bind ICMP socket")?;
 
                 // Set non-blocking
                 socket.set_nonblocking(true).context("set non-blocking")?;

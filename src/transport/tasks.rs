@@ -29,6 +29,7 @@ fn deserialize_control_limited(data: &[u8]) -> Result<Control, bincode::Error> {
         .deserialize::<Control>(data)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn maybe_rotate_udp(
     nonce_seq: &mut NonceSeq,
     rotation_policy: &KeyRotationPolicy,
@@ -140,6 +141,7 @@ async fn maybe_rotate_udp(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn maybe_rotate_io(
     nonce_seq: &mut NonceSeq,
     rotation_policy: &KeyRotationPolicy,
@@ -251,17 +253,11 @@ pub async fn spawn_receiver_task_with_stop(
     }
 
     tokio::spawn(async move {
-        let (tag16, tag8, mut ack_nonce_seq) = {
+        let (tag16, tag8) = {
             let guard = cipher_state.read().await;
-            let ns = match NonceSeq::new(guard.current_key(), NONCE_DOMAIN_APP, 0x03) {
-                Ok(ns) => ns,
-                Err(e) => {
-                    tracing::error!("Ack nonce sequence init failed: {:?}", e);
-                    return;
-                }
-            };
-            (guard.tag16(), guard.tag8(), ns)
+            (guard.tag16(), guard.tag8())
         };
+        let mut ack_nonce_seq: Option<NonceSeq> = None;
         let sock = match connection.get_socket() {
             Some(s) => s,
             None => return,
@@ -313,7 +309,7 @@ pub async fn spawn_receiver_task_with_stop(
                                                         guard.rotate_to(new_key);
                                                     }
                                                     // Re-init ack nonce seq for new key
-                                                    ack_nonce_seq = match NonceSeq::new(
+                                                    ack_nonce_seq = Some(match NonceSeq::new(
                                                         &new_key,
                                                         NONCE_DOMAIN_APP,
                                                         0x03,
@@ -326,33 +322,35 @@ pub async fn spawn_receiver_task_with_stop(
                                                             );
                                                             continue;
                                                         }
-                                                    };
+                                                    });
                                                     // Send ack best-effort
                                                     let ctrl = Control::SessionKeyAck(key_id);
                                                     if let Ok(payload_bytes) = bincode::serialize(&ctrl) {
-                                                        if let Ok((nonce, seq)) =
-                                                            ack_nonce_seq.next_nonce_and_seq()
-                                                        {
-                                                            let clear = ClearPayload {
-                                                                ts_ms: now_ms(),
-                                                                seq,
-                                                                data: payload_bytes,
-                                                            };
-                                                            let pkt = {
-                                                                let guard = cipher_state.read().await;
-                                                                seal_with_nonce(
-                                                                    guard.current_key(),
-                                                                    tag16,
-                                                                    tag8,
-                                                                    &clear,
-                                                                    &nonce,
-                                                                )
-                                                            };
-                                                            if let Ok(pkt) = pkt {
-                                                                if let Ok(raw) =
-                                                                    serialize_cipher_packet(&pkt)
-                                                                {
-                                                                    let _ = sock.send_to(&raw, source).await;
+                                                        if let Some(ns) = ack_nonce_seq.as_mut() {
+                                                            if let Ok((nonce, seq)) =
+                                                                ns.next_nonce_and_seq()
+                                                            {
+                                                                let clear = ClearPayload {
+                                                                    ts_ms: now_ms(),
+                                                                    seq,
+                                                                    data: payload_bytes,
+                                                                };
+                                                                let pkt = {
+                                                                    let guard = cipher_state.read().await;
+                                                                    seal_with_nonce(
+                                                                        guard.current_key(),
+                                                                        tag16,
+                                                                        tag8,
+                                                                        &clear,
+                                                                        &nonce,
+                                                                    )
+                                                                };
+                                                                if let Ok(pkt) = pkt {
+                                                                    if let Ok(raw) =
+                                                                        serialize_cipher_packet(&pkt)
+                                                                    {
+                                                                        let _ = sock.send_to(&raw, source).await;
+                                                                    }
                                                                 }
                                                             }
                                                         }
@@ -406,17 +404,11 @@ pub async fn spawn_receiver_task_with_stop_io(
     mut stop: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let (tag16, tag8, mut ack_nonce_seq) = {
+        let (tag16, tag8) = {
             let guard = cipher_state.read().await;
-            let ns = match NonceSeq::new(guard.current_key(), NONCE_DOMAIN_APP, 0x03) {
-                Ok(ns) => ns,
-                Err(e) => {
-                    tracing::error!("Ack nonce sequence init failed: {:?}", e);
-                    return;
-                }
-            };
-            (guard.tag16(), guard.tag8(), ns)
+            (guard.tag16(), guard.tag8())
         };
+        let mut ack_nonce_seq: Option<NonceSeq> = None;
         let mut rw = crate::crypto::replay::ReplayWindow::new();
         let relay_addr = io.rate_limit_addr();
         let limit = io.max_packet_limit();
@@ -461,7 +453,7 @@ pub async fn spawn_receiver_task_with_stop_io(
                                                         let mut guard = cipher_state.write().await;
                                                         guard.rotate_to(new_key);
                                                     }
-                                                    ack_nonce_seq = match NonceSeq::new(
+                                                    ack_nonce_seq = Some(match NonceSeq::new(
                                                         &new_key,
                                                         NONCE_DOMAIN_APP,
                                                         0x03,
@@ -474,32 +466,34 @@ pub async fn spawn_receiver_task_with_stop_io(
                                                             );
                                                             continue;
                                                         }
-                                                    };
+                                                    });
                                                     let ctrl = Control::SessionKeyAck(key_id);
                                                     if let Ok(payload_bytes) = bincode::serialize(&ctrl) {
-                                                        if let Ok((nonce, seq)) =
-                                                            ack_nonce_seq.next_nonce_and_seq()
-                                                        {
-                                                            let clear = ClearPayload {
-                                                                ts_ms: now_ms(),
-                                                                seq,
-                                                                data: payload_bytes,
-                                                            };
-                                                            let pkt = {
-                                                                let guard = cipher_state.read().await;
-                                                                seal_with_nonce(
-                                                                    guard.current_key(),
-                                                                    tag16,
-                                                                    tag8,
-                                                                    &clear,
-                                                                    &nonce,
-                                                                )
-                                                            };
-                                                            if let Ok(pkt) = pkt {
-                                                                if let Ok(raw) =
-                                                                    serialize_cipher_packet(&pkt)
-                                                                {
-                                                                    let _ = io.send(raw).await;
+                                                        if let Some(ns) = ack_nonce_seq.as_mut() {
+                                                            if let Ok((nonce, seq)) =
+                                                                ns.next_nonce_and_seq()
+                                                            {
+                                                                let clear = ClearPayload {
+                                                                    ts_ms: now_ms(),
+                                                                    seq,
+                                                                    data: payload_bytes,
+                                                                };
+                                                                let pkt = {
+                                                                    let guard = cipher_state.read().await;
+                                                                    seal_with_nonce(
+                                                                        guard.current_key(),
+                                                                        tag16,
+                                                                        tag8,
+                                                                        &clear,
+                                                                        &nonce,
+                                                                    )
+                                                                };
+                                                                if let Ok(pkt) = pkt {
+                                                                    if let Ok(raw) =
+                                                                        serialize_cipher_packet(&pkt)
+                                                                    {
+                                                                        let _ = io.send(raw).await;
+                                                                    }
                                                                 }
                                                             }
                                                         }
@@ -535,8 +529,8 @@ pub async fn spawn_receiver_task_with_stop_io(
 /// Task di invio con shutdown channel + metriche + Session Encryption
 pub async fn spawn_sender_task_with_stop(
     connection: Connection,
-    mut rx_out: mpsc::Receiver<Vec<u8>>,
-    mut stop: tokio::sync::watch::Receiver<bool>,
+    rx_out: mpsc::Receiver<Vec<u8>>,
+    stop: tokio::sync::watch::Receiver<bool>,
     metrics: MetricsCollector,
     cipher_state: Arc<tokio::sync::RwLock<SessionKeyState>>,
     rotation_policy: KeyRotationPolicy,
@@ -557,15 +551,18 @@ pub async fn spawn_sender_task_with_stop(
     }
 
     tokio::spawn(async move {
+        let mut rx_out = rx_out;
+        let mut stop = stop;
         let (tag16, tag8) = {
             let guard = cipher_state.read().await;
             (guard.tag16(), guard.tag8())
         };
         debug_assert!(is_valid_app_role(app_role));
-        let mut nonce_seq = match {
+        let nonce_init = {
             let guard = cipher_state.read().await;
             NonceSeq::new(guard.current_key(), NONCE_DOMAIN_APP, app_role)
-        } {
+        };
+        let mut nonce_seq = match nonce_init {
             Ok(ns) => ns,
             Err(e) => {
                 tracing::error!("Nonce sequence init failed: {:?}", e);
@@ -675,23 +672,26 @@ pub async fn spawn_sender_task_with_stop(
 /// Task di invio con shutdown channel + metriche per TransportIo (Guaranteed)
 pub async fn spawn_sender_task_with_stop_io(
     io: Arc<dyn TransportIo>,
-    mut rx_out: mpsc::Receiver<Vec<u8>>,
-    mut stop: tokio::sync::watch::Receiver<bool>,
+    rx_out: mpsc::Receiver<Vec<u8>>,
+    stop: tokio::sync::watch::Receiver<bool>,
     metrics: MetricsCollector,
     cipher_state: Arc<tokio::sync::RwLock<SessionKeyState>>,
     rotation_policy: KeyRotationPolicy,
     app_role: u8,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut rx_out = rx_out;
+        let mut stop = stop;
         let (tag16, tag8) = {
             let guard = cipher_state.read().await;
             (guard.tag16(), guard.tag8())
         };
         debug_assert!(is_valid_app_role(app_role));
-        let mut nonce_seq = match {
+        let nonce_init = {
             let guard = cipher_state.read().await;
             NonceSeq::new(guard.current_key(), NONCE_DOMAIN_APP, app_role)
-        } {
+        };
+        let mut nonce_seq = match nonce_init {
             Ok(ns) => ns,
             Err(e) => {
                 tracing::error!("Nonce sequence init failed: {:?}", e);

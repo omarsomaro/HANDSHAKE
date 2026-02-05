@@ -233,7 +233,7 @@ pub async fn establish_connection(p: &RendezvousParams, cfg: &Config) -> Result<
                 }
             }
             TransportKind::Tor => match wan::try_tor_mode(cfg).await {
-                Ok(wan_conn) => return Ok(connection_from_wan(wan_conn).await?),
+                Ok(wan_conn) => return connection_from_wan(wan_conn).await,
                 Err(e) => tracing::warn!("Tor failed: {}", e),
             },
         }

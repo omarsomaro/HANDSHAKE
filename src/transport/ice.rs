@@ -534,7 +534,7 @@ impl IceAgent {
     }
 
     fn get_local_ip_addresses(&self) -> Result<Vec<IpAddr>> {
-        Ok(crate::transport::lan::get_local_ip_addresses()?)
+        crate::transport::lan::get_local_ip_addresses()
     }
 }
 

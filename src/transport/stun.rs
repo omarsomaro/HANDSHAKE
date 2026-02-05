@@ -218,56 +218,57 @@ fn parse_xor_mapped_address(response: &[u8], tx_id: &[u8; 12]) -> Result<SocketA
         let attr_len = u16::from_be_bytes([response[offset + 2], response[offset + 3]]) as usize;
         let padded_len = attr_len.div_ceil(4) * 4;
 
-        if attr_type == 0x0020 || attr_type == 0x0001 {
-            if offset + 4 + attr_len <= response.len() && attr_len >= 8 {
-                let family = response[offset + 5];
-                if family == 0x01 {
-                    let port = u16::from_be_bytes([response[offset + 6], response[offset + 7]]);
-                    let ip = Ipv4Addr::new(
-                        response[offset + 8],
-                        response[offset + 9],
-                        response[offset + 10],
-                        response[offset + 11],
+        if (attr_type == 0x0020 || attr_type == 0x0001)
+            && offset + 4 + attr_len <= response.len()
+            && attr_len >= 8
+        {
+            let family = response[offset + 5];
+            if family == 0x01 {
+                let port = u16::from_be_bytes([response[offset + 6], response[offset + 7]]);
+                let ip = Ipv4Addr::new(
+                    response[offset + 8],
+                    response[offset + 9],
+                    response[offset + 10],
+                    response[offset + 11],
+                );
+
+                let (port, ip) = if attr_type == 0x0020 {
+                    let xored_port = port ^ ((STUN_MAGIC_COOKIE >> 16) as u16);
+                    let xored_ip = Ipv4Addr::new(
+                        ip.octets()[0] ^ ((STUN_MAGIC_COOKIE >> 24) as u8),
+                        ip.octets()[1] ^ ((STUN_MAGIC_COOKIE >> 16) as u8),
+                        ip.octets()[2] ^ ((STUN_MAGIC_COOKIE >> 8) as u8),
+                        ip.octets()[3] ^ (STUN_MAGIC_COOKIE as u8),
                     );
+                    (xored_port, xored_ip)
+                } else {
+                    (port, ip)
+                };
 
-                    let (port, ip) = if attr_type == 0x0020 {
-                        let xored_port = port ^ ((STUN_MAGIC_COOKIE >> 16) as u16);
-                        let xored_ip = Ipv4Addr::new(
-                            ip.octets()[0] ^ ((STUN_MAGIC_COOKIE >> 24) as u8),
-                            ip.octets()[1] ^ ((STUN_MAGIC_COOKIE >> 16) as u8),
-                            ip.octets()[2] ^ ((STUN_MAGIC_COOKIE >> 8) as u8),
-                            ip.octets()[3] ^ (STUN_MAGIC_COOKIE as u8),
-                        );
-                        (xored_port, xored_ip)
-                    } else {
-                        (port, ip)
-                    };
+                return Ok(SocketAddr::V4(SocketAddrV4::new(ip, port)));
+            } else if family == 0x02 && attr_len >= 20 {
+                let port = u16::from_be_bytes([response[offset + 6], response[offset + 7]]);
+                let mut addr_bytes = [0u8; 16];
+                addr_bytes.copy_from_slice(&response[offset + 8..offset + 24]);
 
-                    return Ok(SocketAddr::V4(SocketAddrV4::new(ip, port)));
-                } else if family == 0x02 && attr_len >= 20 {
-                    let port = u16::from_be_bytes([response[offset + 6], response[offset + 7]]);
-                    let mut addr_bytes = [0u8; 16];
-                    addr_bytes.copy_from_slice(&response[offset + 8..offset + 24]);
-
-                    if attr_type == 0x0020 {
-                        // XOR with magic cookie + transaction ID
-                        let mut xor_bytes = [0u8; 16];
-                        xor_bytes[..4].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
-                        xor_bytes[4..].copy_from_slice(tx_id);
-                        for i in 0..16 {
-                            addr_bytes[i] ^= xor_bytes[i];
-                        }
+                if attr_type == 0x0020 {
+                    // XOR with magic cookie + transaction ID
+                    let mut xor_bytes = [0u8; 16];
+                    xor_bytes[..4].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+                    xor_bytes[4..].copy_from_slice(tx_id);
+                    for i in 0..16 {
+                        addr_bytes[i] ^= xor_bytes[i];
                     }
-
-                    let port = if attr_type == 0x0020 {
-                        port ^ ((STUN_MAGIC_COOKIE >> 16) as u16)
-                    } else {
-                        port
-                    };
-
-                    let ip = std::net::Ipv6Addr::from(addr_bytes);
-                    return Ok(SocketAddr::new(IpAddr::V6(ip), port));
                 }
+
+                let port = if attr_type == 0x0020 {
+                    port ^ ((STUN_MAGIC_COOKIE >> 16) as u16)
+                } else {
+                    port
+                };
+
+                let ip = std::net::Ipv6Addr::from(addr_bytes);
+                return Ok(SocketAddr::new(IpAddr::V6(ip), port));
             }
         }
 

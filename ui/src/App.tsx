@@ -1,6 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { readTextFile, exists } from "@tauri-apps/plugin-fs";
 import QRCode from "qrcode";
 import { useSSE } from "./hooks/useSSE";
 import { useLogs } from "./hooks/useLogs";
@@ -63,8 +62,7 @@ type DaemonStatus = {
 interface StartResult {
   pid: number;
   api_url: string;
-  token_file_path: string;
-  token_required: boolean;
+  token: string;
 }
 
 interface SetPassResponse {
@@ -126,20 +124,10 @@ interface DebugMetricsResponse {
   status: string;
 }
 
-async function readTokenFile(path: string): Promise<string> {
-  const present = await exists(path);
-  if (!present) {
-    throw new Error("token file not found");
-  }
-  const data = await readTextFile(path);
-  return data.trim();
-}
-
 export default function App() {
   const [apiBind, setApiBind] = useState(DEFAULT_API_BIND);
   const [unsafeExpose, setUnsafeExpose] = useState(false);
   const [daemonStatus, setDaemonStatus] = useState<DaemonStatus>({ running: false });
-  const [tokenFile, setTokenFile] = useState<string | null>(null);
   const [token, setToken] = useState<string | null>(null);
   const [passphrase, setPassphrase] = useState("");
   const [showPassphrase, setShowPassphrase] = useState(false);
@@ -234,36 +222,24 @@ export default function App() {
     return { label: "poor", tone: "danger" };
   }, [metrics]);
 
-  const refreshAuth = useCallback(async () => {
-    if (!tokenFile) throw new Error("token file not set");
-    const t = await readTokenFile(tokenFile);
-    setToken(t);
-    return t;
-  }, [tokenFile]);
-
   const fetchWithAuth = useCallback(
-    async (path: string, options?: RequestInit, retry = true) => {
-      const requiresAuth = Boolean(tokenFile);
-      const activeToken = requiresAuth ? token ?? (retry ? await refreshAuth() : null) : null;
-      if (requiresAuth && !activeToken) throw new Error("token not loaded");
+    async (path: string, options?: RequestInit) => {
+      const activeToken = token;
+      if (!activeToken) throw new Error("token not loaded");
       const headers = new Headers(options?.headers || {});
       if (activeToken) {
         headers.set("Authorization", `Bearer ${activeToken}`);
       }
       headers.set("Content-Type", "application/json");
       const res = await fetch(`${apiUrl}${path}`, { ...options, headers });
-      if ((res.status === 401 || res.status === 403) && retry) {
-        await refreshAuth();
-        return fetchWithAuth(path, options, false);
-      }
       if (!res.ok) throw new Error(`API error ${res.status}`);
       return res;
     },
-    [apiUrl, token, tokenFile, refreshAuth]
+    [apiUrl, token]
   );
 
   const refreshStatus = useCallback(async () => {
-    if (tokenFile && !token) return;
+    if (!token) return;
     try {
       const res = await fetchWithAuth("/v1/status");
       const data = await res.json();
@@ -271,7 +247,7 @@ export default function App() {
     } catch (err) {
       logLine("STATUS", (err as Error).message);
     }
-  }, [fetchWithAuth, logLine, token, tokenFile]);
+  }, [fetchWithAuth, logLine, token]);
 
   const startStatusPoll = useCallback(() => {
     if (statusTimer.current) clearInterval(statusTimer.current);
@@ -286,7 +262,7 @@ export default function App() {
   }, []);
 
   const { state: sseState } = useSSE(`${apiUrl}/v1/recv`, {
-    enabled: sseEnabled && (tokenFile ? !!token : true),
+    enabled: sseEnabled && !!token,
     headers: authHeader,
     onEvent: (evt) => {
       if (evt.data && evt.data !== "ok") {
@@ -326,12 +302,7 @@ export default function App() {
       });
 
       setDaemonStatus({ running: true, pid: result.pid });
-      if (result.token_required && result.token_file_path) {
-        setTokenFile(result.token_file_path);
-      } else {
-        setTokenFile(null);
-        setToken(null);
-      }
+      setToken(result.token);
       setWarning(null);
       logLine("DAEMON", `started pid=${result.pid}`);
     } catch (err) {
@@ -387,19 +358,13 @@ export default function App() {
   const handleStopDaemon = useCallback(async () => {
     await invoke("stop_daemon");
     setDaemonStatus({ running: false });
-    setTokenFile(null);
     setToken(null);
     stopStatusPoll();
     setSseEnabled(false);
     logLine("DAEMON", "stopped");
   }, [logLine, stopStatusPoll]);
 
-  const loadToken = useCallback(async () => {
-    if (!tokenFile) return;
-    const t = await readTokenFile(tokenFile);
-    setToken(t);
-    logLine("TOKEN", "loaded");
-  }, [tokenFile, logLine]);
+  // Token is passed in-RAM by the launcher; no token file on disk.
 
   const handleSetPassphrase = useCallback(async () => {
     if (!passphrase) return;
@@ -612,7 +577,6 @@ export default function App() {
       if (!daemonStatus.running) {
         await handleStartDaemon();
       }
-      await loadToken();
       await handleSetPassphrase();
       await handleConnectCascade();
       setSseEnabled(true);
@@ -625,7 +589,6 @@ export default function App() {
     passphrase,
     daemonStatus.running,
     handleStartDaemon,
-    loadToken,
     handleSetPassphrase,
     handleConnectCascade,
     startStatusPoll
@@ -730,11 +693,7 @@ export default function App() {
     };
   }, [daemonStatus.running, logLine]);
 
-  useEffect(() => {
-    if (tokenFile) {
-      loadToken().catch((err) => logLine("TOKEN", (err as Error).message));
-    }
-  }, [tokenFile, loadToken]);
+  // no token-file loading
 
   useEffect(() => {
     const err = daemonStatus.last_error || null;
@@ -810,16 +769,12 @@ export default function App() {
 
   const usesClassicPass =
     flowMode === "classic" || flowMode === "offer" || flowMode === "target";
-  const tokenReady = tokenFile ? Boolean(token) : true;
+  const tokenReady = Boolean(token);
   const apiReady = daemonStatus.running && tokenReady;
   const canSetPassphrase = passphrase.trim().length > 0 && apiReady;
   const canStartAuto = passphrase.trim().length > 0;
 
-  const tokenStatus = tokenFile
-    ? token
-      ? "token loaded"
-      : "token missing"
-    : "no auth";
+  const tokenStatus = token ? "token loaded" : "token missing";
   const daemonLabel = daemonStatus.running
     ? `running pid ${daemonStatus.pid ?? "?"}`
     : "stopped";
@@ -927,15 +882,9 @@ export default function App() {
                 &nbsp;Allow unsafe expose
               </label>
               <div style={{ marginTop: 12, fontSize: 12 }}>
-                Token file: {tokenFile ?? "n/a"}
-              </div>
-              <div style={{ marginTop: 6, fontSize: 12 }}>
-                Token: {tokenFile ? (token ? "loaded" : "missing") : "no auth"}
+                Token: {token ? "loaded" : "missing"}
               </div>
               <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
-                <button className="secondary" onClick={loadToken} disabled={!tokenFile}>
-                  Load token
-                </button>
                 <button className="secondary" onClick={handleFetchDaemonLogs}>
                   Fetch daemon logs
                 </button>

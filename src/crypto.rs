@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
+use zeroize::Zeroize;
 
 pub const NONCE_DOMAIN_NOISE: u8 = 0x01;
 pub const NONCE_DOMAIN_APP: u8 = 0x02;
@@ -148,6 +149,10 @@ impl SessionKeyState {
     }
 
     pub fn rotate_to(&mut self, new_key: [u8; 32]) {
+        // Ensure any previously retained key does not linger in memory when overwritten.
+        if let Some(prev) = self.previous_key.as_mut() {
+            prev.zeroize();
+        }
         self.previous_key = Some(self.current_key);
         self.prev_expires_at_ms = Some(now_ms().saturating_add(self.grace_ms));
         self.current_key = new_key;
@@ -174,6 +179,9 @@ impl SessionKeyState {
     pub fn prune_expired(&mut self) {
         if let Some(ts) = self.prev_expires_at_ms {
             if now_ms() > ts {
+                if let Some(prev) = self.previous_key.as_mut() {
+                    prev.zeroize();
+                }
                 self.previous_key = None;
                 self.prev_expires_at_ms = None;
             }
@@ -186,6 +194,15 @@ impl SessionKeyState {
 
     pub fn last_ack_id(&self) -> Option<u64> {
         self.last_ack_id
+    }
+}
+
+impl Drop for SessionKeyState {
+    fn drop(&mut self) {
+        self.current_key.zeroize();
+        if let Some(prev) = self.previous_key.as_mut() {
+            prev.zeroize();
+        }
     }
 }
 
@@ -472,6 +489,18 @@ pub fn hash_offer(offer: &crate::offer::OfferPayload) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_session_key_state_prunes_expired_previous_key() {
+        let mut st = SessionKeyState::new([1u8; 32], 0x1337, 0x42, 0);
+        st.previous_key = Some([2u8; 32]);
+        st.prev_expires_at_ms = Some(now_ms().saturating_sub(1));
+
+        st.prune_expired();
+
+        assert!(st.previous_key.is_none());
+        assert!(st.prev_expires_at_ms.is_none());
+    }
 
     #[test]
     fn test_seal_open_roundtrip() {

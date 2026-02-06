@@ -1,25 +1,19 @@
 use anyhow::{Context, Result};
-use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::collections::HashSet;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
-use tokio::select;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::derive::RendezvousParams;
-use crate::offer::{Endpoint, EndpointKind, OfferPayload};
+use crate::offer::{EndpointKind, OfferPayload};
+use crate::resume::ResumeParams;
 use crate::session_noise::NoiseRole;
 use crate::transport::wan_tor;
-use crate::transport::{
-    self,
-    nat_detection::{self, NatDetector},
-    Connection,
-};
-
-type IceAttemptFuture = BoxFuture<'static, Result<Option<(Connection, SocketAddr)>>>;
+use crate::transport::{self, Connection};
 
 #[derive(Debug, Clone)]
 pub struct IceCandidate {
@@ -44,7 +38,6 @@ pub struct IceAgent {
     config: Config,
     noise_role: NoiseRole,
     offer: OfferPayload,
-    offer_hash: [u8; 32],
     attempted: Arc<Mutex<std::collections::HashMap<IceCandidateKind, usize>>>,
 }
 
@@ -56,150 +49,75 @@ impl IceAgent {
         offer: OfferPayload,
         offer_hash: [u8; 32],
     ) -> Self {
+        let _ = offer_hash; // retained for compatibility; can be removed in next cleanup patch
         Self {
             params,
             config,
             noise_role,
             offer,
-            offer_hash,
             attempted: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
     }
 
-    async fn gather_lan_candidates(&self) -> Result<Vec<IceCandidate>> {
-        let local_addrs = self.get_local_ip_addresses()?;
-        let mut candidates = Vec::new();
+    fn gather_peer_candidates(&self) -> Vec<IceCandidate> {
+        // IMPORTANT: candidates are *peer* targets from the offer, not local IPs.
+        let mut out = Vec::new();
+        let mut seen = HashSet::<(IceCandidateKind, SocketAddr)>::new();
 
-        for ip in local_addrs {
-            let addr = SocketAddr::new(ip, self.params.port);
-            candidates.push(IceCandidate {
-                kind: IceCandidateKind::Lan,
-                priority: 100,
-                addr: Some(addr),
-                timeout_ms: 1200,
-                retry_count: 0,
-            });
-        }
-
-        Ok(candidates)
-    }
-
-    async fn gather_upnp_candidates(&self) -> Result<Vec<IceCandidate>> {
-        match transport::wan_direct::try_direct_port_forward(self.params.port).await {
-            Ok((_, ext_addr)) => {
-                info!("UPnP/NAT-PMP/PCP mapping successful: {}", ext_addr);
-                Ok(vec![IceCandidate {
-                    kind: IceCandidateKind::Upnp,
-                    priority: 80,
-                    addr: Some(ext_addr),
-                    timeout_ms: 2000,
-                    retry_count: 0,
-                }])
+        for ep in &self.offer.endpoints {
+            match (ep.kind.clone(), ep.addr) {
+                (EndpointKind::Lan, Some(addr)) => {
+                    if addr.ip().is_unspecified() || addr.port() == 0 {
+                        continue;
+                    }
+                    if seen.insert((IceCandidateKind::Lan, addr)) {
+                        out.push(IceCandidate {
+                            kind: IceCandidateKind::Lan,
+                            priority: 100 + ep.priority as u32,
+                            addr: Some(addr),
+                            timeout_ms: ep.timeout_ms.max(1500),
+                            retry_count: 0,
+                        });
+                    }
+                }
+                (EndpointKind::Wan, Some(addr)) => {
+                    if addr.ip().is_unspecified() || addr.port() == 0 {
+                        continue;
+                    }
+                    // Treat offer WAN endpoint as a direct UDP target.
+                    if seen.insert((IceCandidateKind::Stun, addr)) {
+                        out.push(IceCandidate {
+                            kind: IceCandidateKind::Stun,
+                            priority: 90 + ep.priority as u32,
+                            addr: Some(addr),
+                            timeout_ms: ep.timeout_ms.max(self.config.wan_connect_timeout_ms),
+                            retry_count: 0,
+                        });
+                    }
+                }
+                (EndpointKind::Tor, _) => {
+                    // Tor has no SocketAddr target; handled by gather_tor_candidates().
+                }
+                _ => {}
             }
-            Err(e) => {
-                debug!("UPnP/NAT-PMP/PCP failed: {}", e);
-                Ok(vec![])
-            }
-        }
-    }
-
-    async fn gather_stun_candidates(&self) -> Result<Vec<IceCandidate>> {
-        let stun_servers = &self.config.nat_detection_servers;
-        if stun_servers.is_empty() {
-            return Ok(vec![]);
         }
 
-        let mut candidates = Vec::new();
-
-        for stun_server in stun_servers.iter().take(3) {
-            match tokio::time::timeout(Duration::from_secs(3), self.stun_binding(stun_server)).await
+        if let Some(addr) = self.offer.stun_public_addr {
+            if !addr.ip().is_unspecified()
+                && addr.port() != 0
+                && seen.insert((IceCandidateKind::Stun, addr))
             {
-                Ok(Ok(Some(ext_addr))) => {
-                    info!("STUN binding successful via {}: {}", stun_server, ext_addr);
-                    candidates.push(IceCandidate {
-                        kind: IceCandidateKind::Stun,
-                        priority: 70,
-                        addr: Some(ext_addr),
-                        timeout_ms: 3000,
-                        retry_count: 0,
-                    });
-                }
-                Ok(Ok(None)) => {
-                    warn!("STUN binding returned no result from {}", stun_server);
-                }
-                Ok(Err(e)) => {
-                    warn!("STUN binding failed for {}: {}", stun_server, e);
-                }
-                Err(_) => {
-                    warn!("STUN binding timeout for {}", stun_server);
-                }
+                out.push(IceCandidate {
+                    kind: IceCandidateKind::Stun,
+                    priority: 70,
+                    addr: Some(addr),
+                    timeout_ms: self.config.wan_connect_timeout_ms.max(3000),
+                    retry_count: 0,
+                });
             }
         }
 
-        Ok(candidates)
-    }
-
-    async fn stun_binding(&self, stun_server: &str) -> Result<Option<SocketAddr>> {
-        let local_sock = UdpSocket::bind("0.0.0.0:0")
-            .await
-            .context("bind STUN local socket")?;
-
-        let stun_addr: SocketAddr = stun_server.parse().context("parse STUN server address")?;
-
-        let mut buf = vec![0u8; 512];
-
-        let tx_id: [u8; 12] = rand::random();
-        let binding_request = self.build_stun_binding_request(tx_id);
-
-        local_sock.send_to(&binding_request, stun_addr).await?;
-
-        let (n, _) =
-            tokio::time::timeout(Duration::from_secs(2), local_sock.recv_from(&mut buf)).await??;
-
-        let response = &buf[..n];
-
-        if response.len() < 20 || response[0..2] != [0x01, 0x01] {
-            return Ok(None);
-        }
-
-        let message_len = u16::from_be_bytes([response[2], response[3]]) as usize;
-        if response.len() < 20 + message_len {
-            return Ok(None);
-        }
-
-        let mut offset = 20;
-        while offset + 4 <= response.len() {
-            let attr_type = u16::from_be_bytes([response[offset], response[offset + 1]]);
-            let attr_len =
-                u16::from_be_bytes([response[offset + 2], response[offset + 3]]) as usize;
-            let padded_len = attr_len.div_ceil(4) * 4;
-
-            if attr_type == 0x0020 && offset + 4 + attr_len <= response.len() && attr_len >= 8 {
-                let family = response[offset + 5];
-                if family == 0x01 {
-                    let port = u16::from_be_bytes([response[offset + 6], response[offset + 7]]);
-                    let ip = Ipv4Addr::new(
-                        response[offset + 8],
-                        response[offset + 9],
-                        response[offset + 10],
-                        response[offset + 11],
-                    );
-                    return Ok(Some(SocketAddr::new(ip.into(), port)));
-                }
-            }
-
-            offset += 4 + padded_len;
-        }
-
-        Ok(None)
-    }
-
-    fn build_stun_binding_request(&self, tx_id: [u8; 12]) -> Vec<u8> {
-        let mut req = Vec::new();
-        req.extend_from_slice(&[0x00, 0x01]);
-        req.extend_from_slice(&[0x00, 0x00]);
-        req.extend_from_slice(&tx_id);
-        req
+        out
     }
 
     async fn gather_relay_candidates(&self) -> Result<Vec<IceCandidate>> {
@@ -236,213 +154,156 @@ impl IceAgent {
         }])
     }
 
-    async fn race_candidates(&self) -> Result<(Connection, SocketAddr)> {
-        let candidates = self.gather_candidates().await?;
+    async fn connect_first_validated(
+        &self,
+        resume: Option<&ResumeParams>,
+    ) -> Result<crate::transport::OfferConnectResult> {
+        let mut candidates = self.gather_candidates().await?;
+        candidates.sort_by(|a, b| b.priority.cmp(&a.priority));
 
-        for candidate in candidates.clone().iter() {
-            if candidate.kind == IceCandidateKind::Lan
-                || candidate.kind == IceCandidateKind::Upnp
-                || candidate.kind == IceCandidateKind::Stun
-            {
-                if let Some(addr) = candidate.addr {
+        for c in &candidates {
+            if matches!(c.kind, IceCandidateKind::Lan | IceCandidateKind::Stun) {
+                if let Some(addr) = c.addr {
                     debug!(
                         "Testing {} candidate at {}",
-                        format!("{:?}", candidate.kind).to_lowercase(),
+                        format!("{:?}", c.kind).to_lowercase(),
                         addr
                     );
                 }
             }
         }
 
-        let udp_dispatch = Arc::new(
-            UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], self.params.port)))
-                .await
-                .context("bind UDP socket for ICE")?,
-        );
+        let mut udp_dispatch: Option<Arc<UdpSocket>> = None;
 
-        let mut eligible = Vec::new();
+        // NOTE: We intentionally validate a candidate by completing the resume/noise handshake.
+        // Parallel UDP attempts would contend on a single recv_from() socket, so we do priority-ordered attempts.
+        let global_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         for candidate in candidates {
+            if tokio::time::Instant::now() >= global_deadline {
+                break;
+            }
+
             if self.is_exhausted(&candidate.kind).await {
                 continue;
             }
-            eligible.push(candidate);
-        }
+            self.mark_attempted(&candidate.kind).await;
 
-        let futures: FuturesUnordered<IceAttemptFuture> = FuturesUnordered::new();
+            let attempt = match candidate.kind {
+                IceCandidateKind::Lan => match candidate.addr {
+                    Some(addr) => {
+                        let dispatch =
+                            bind_udp_dispatch(&mut udp_dispatch, self.params.port).await?;
+                        self.attempt_udp_handshake(
+                            addr,
+                            dispatch,
+                            EndpointKind::Lan,
+                            candidate.timeout_ms,
+                            resume,
+                            "lan",
+                        )
+                        .await?
+                    }
+                    None => None,
+                },
+                IceCandidateKind::Stun | IceCandidateKind::Upnp => match candidate.addr {
+                    Some(addr) => {
+                        let dispatch =
+                            bind_udp_dispatch(&mut udp_dispatch, self.params.port).await?;
+                        self.attempt_udp_handshake(
+                            addr,
+                            dispatch,
+                            EndpointKind::Wan,
+                            candidate.timeout_ms.max(self.config.wan_connect_timeout_ms),
+                            resume,
+                            "wan",
+                        )
+                        .await?
+                    }
+                    None => None,
+                },
+                IceCandidateKind::Relay => self.attempt_relay_handshake(resume).await?,
+                IceCandidateKind::Tor => self.attempt_tor_handshake(resume).await?,
+            };
 
-        for candidate in eligible {
-            let agent = self.clone();
-            let dispatch = udp_dispatch.clone();
-            futures.push(async move { agent.attempt_candidate(candidate, dispatch).await }.boxed());
-        }
-
-        let result = select! {
-            res = self.wait_first_success(futures) => res,
-            _ = tokio::time::sleep(Duration::from_secs(15)) => {
-                Err(anyhow::anyhow!("Global ICE timeout"))
+            if let Some(ok) = attempt {
+                return Ok(ok);
             }
-        };
 
-        result
-    }
-
-    /// Raccoglie i candidati con strategia adattiva basata su NAT type
-    async fn gather_candidates(&self) -> Result<Vec<IceCandidate>> {
-        let detector = NatDetector::new(self.config.nat_detection_servers.clone());
-        let nat_type = detector.detect_nat_type().await.unwrap_or_else(|e| {
-            tracing::warn!("NAT detection failed, using Unknown: {}", e);
-            crate::transport::nat_detection::NatType::Unknown
-        });
-
-        let mut candidates = Vec::new();
-
-        // LAN sempre prioritario
-        if let Ok(lan_eps) = self.gather_lan_candidates().await {
-            candidates.extend(lan_eps);
-        }
-
-        // Seleziona strategia basata su NAT type
-        let strategy = nat_detection::NatDetector::select_strategy(nat_type);
-
-        for priority in strategy {
-            match priority.kind {
-                crate::transport::nat_detection::TransportKind::Upnp if !priority.should_skip => {
-                    if let Ok(upnp_eps) = self.gather_upnp_candidates().await {
-                        candidates.extend(upnp_eps);
-                    }
-                }
-                crate::transport::nat_detection::TransportKind::Stun if !priority.should_skip => {
-                    if let Ok(stun_eps) = self.gather_stun_candidates().await {
-                        candidates.extend(stun_eps);
-                    }
-                }
-                crate::transport::nat_detection::TransportKind::Relay => {
-                    if let Ok(relay_eps) = self.gather_relay_candidates().await {
-                        candidates.extend(relay_eps);
-                    }
-                }
-                crate::transport::nat_detection::TransportKind::Tor => {
-                    if let Ok(tor_eps) = self.gather_tor_candidates().await {
-                        candidates.extend(tor_eps);
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        // Sort by priority (higher priority first)
-        candidates.sort_by(|a, b| b.priority.cmp(&a.priority));
-
-        Ok(candidates)
-    }
-
-    async fn wait_first_success(
-        &self,
-        mut futures: FuturesUnordered<IceAttemptFuture>,
-    ) -> Result<(Connection, SocketAddr)> {
-        while let Some(res) = futures.next().await {
-            match res {
-                Ok(Some((conn, addr))) => return Ok((conn, addr)),
-                Ok(None) => continue,
-                Err(e) => {
-                    warn!("ICE candidate failed: {}", e);
-                    continue;
-                }
-            }
+            self.schedule_retry(&candidate.kind).await;
         }
 
         Err(anyhow::anyhow!("All ICE candidates failed"))
     }
 
-    async fn attempt_candidate(
-        &self,
-        candidate: IceCandidate,
-        dispatch: Arc<UdpSocket>,
-    ) -> Result<Option<(Connection, SocketAddr)>> {
-        self.mark_attempted(&candidate.kind).await;
-
-        let result = match candidate.kind {
-            IceCandidateKind::Lan => {
-                if let Some(addr) = candidate.addr {
-                    self.attempt_udp_connection(addr, dispatch, EndpointKind::Lan)
-                        .await
-                } else {
-                    Ok(None)
-                }
-            }
-            IceCandidateKind::Upnp => {
-                if let Some(addr) = candidate.addr {
-                    self.attempt_udp_connection(addr, dispatch, EndpointKind::Wan)
-                        .await
-                } else {
-                    Ok(None)
-                }
-            }
-            IceCandidateKind::Stun => {
-                if let Some(addr) = candidate.addr {
-                    self.attempt_udp_connection(addr, dispatch, EndpointKind::Wan)
-                        .await
-                } else {
-                    Ok(None)
-                }
-            }
-            IceCandidateKind::Relay => self.attempt_relay().await,
-            IceCandidateKind::Tor => self.attempt_tor().await,
-        };
-
-        if result.is_err() {
-            self.schedule_retry(&candidate.kind).await;
-        }
-
-        result
+    async fn gather_candidates(&self) -> Result<Vec<IceCandidate>> {
+        let mut candidates = self.gather_peer_candidates();
+        candidates.extend(self.gather_relay_candidates().await?);
+        candidates.extend(self.gather_tor_candidates().await?);
+        candidates.sort_by(|a, b| b.priority.cmp(&a.priority));
+        Ok(candidates)
     }
 
-    async fn attempt_udp_connection(
+    async fn attempt_udp_handshake(
         &self,
         addr: SocketAddr,
         dispatch: Arc<UdpSocket>,
         kind: EndpointKind,
-    ) -> Result<Option<(Connection, SocketAddr)>> {
-        let endpoint = Endpoint {
-            kind,
-            addr: Some(addr),
-            priority: 0,
-            timeout_ms: 2000,
+        timeout_ms: u64,
+        resume: Option<&ResumeParams>,
+        mode: &str,
+    ) -> Result<Option<crate::transport::OfferConnectResult>> {
+        let conn = match kind {
+            EndpointKind::Lan => Connection::Lan(dispatch, addr),
+            EndpointKind::Wan => Connection::Wan(dispatch, addr),
+            EndpointKind::Tor => {
+                return Ok(None);
+            }
         };
 
-        let result = tokio::time::timeout(
-            Duration::from_millis(2000),
-            establish_connection_from_candidate(
-                &self.offer,
-                &self.config,
-                self.noise_role,
-                dispatch,
-                endpoint,
-            ),
-        )
-        .await;
+        let timeout_ms = timeout_ms.max(2000).min(20_000);
+        let tag8 = self.params.tag8;
+        let key_enc = self.offer.rendezvous.key_enc;
+        let tag16 = self.offer.rendezvous.tag16;
+        let noise_role = self.noise_role;
 
-        match result {
-            Ok(Ok(connect_result)) => {
-                let peer_addr = if let Some(peer) = &connect_result.peer {
-                    peer.parse().unwrap_or(addr)
-                } else {
-                    addr
-                };
-                Ok(Some((connect_result.conn, peer_addr)))
+        let handshake = async {
+            if let Some(resume) = resume {
+                crate::session_noise::run_resume_or_noise(
+                    noise_role, &conn, &key_enc, tag16, tag8, resume,
+                )
+                .await
+            } else {
+                let sk = crate::session_noise::run_noise_upgrade(
+                    noise_role, &conn, &key_enc, tag16, tag8,
+                )
+                .await?;
+                Ok((sk, false))
             }
+        };
+
+        match tokio::time::timeout(Duration::from_millis(timeout_ms), handshake).await {
+            Ok(Ok((session_key, resume_used))) => Ok(Some(crate::transport::OfferConnectResult {
+                conn,
+                session_key,
+                mode: mode.to_string(),
+                peer: Some(addr.to_string()),
+                resume_used: Some(resume_used),
+            })),
             Ok(Err(e)) => {
-                warn!("UDP connection attempt failed for {}: {}", addr, e);
+                warn!("UDP candidate {} handshake failed: {}", addr, e);
                 Ok(None)
             }
             Err(_) => {
-                warn!("UDP connection attempt timeout for {}", addr);
+                warn!("UDP candidate {} handshake timeout", addr);
                 Ok(None)
             }
         }
     }
 
-    async fn attempt_relay(&self) -> Result<Option<(Connection, SocketAddr)>> {
+    async fn attempt_relay_handshake(
+        &self,
+        resume: Option<&ResumeParams>,
+    ) -> Result<Option<crate::transport::OfferConnectResult>> {
         let attempt_start = tokio::time::Instant::now();
         let mut attempts = 0;
 
@@ -465,10 +326,39 @@ impl IceAgent {
             {
                 Ok(Ok(conn)) => {
                     info!("WAN Assist: success after {} attempts", attempts);
-                    let relay_addr = relay
-                        .parse()
-                        .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
-                    return Ok(Some((conn, relay_addr)));
+                    let tag8 = self.params.tag8;
+                    let key_enc = self.offer.rendezvous.key_enc;
+                    let tag16 = self.offer.rendezvous.tag16;
+                    let noise_role = self.noise_role;
+
+                    let handshake = async {
+                        if let Some(resume) = resume {
+                            crate::session_noise::run_resume_or_noise(
+                                noise_role, &conn, &key_enc, tag16, tag8, resume,
+                            )
+                            .await
+                        } else {
+                            let sk = crate::session_noise::run_noise_upgrade(
+                                noise_role, &conn, &key_enc, tag16, tag8,
+                            )
+                            .await?;
+                            Ok((sk, false))
+                        }
+                    };
+
+                    match tokio::time::timeout(Duration::from_secs(8), handshake).await {
+                        Ok(Ok((session_key, resume_used))) => {
+                            return Ok(Some(crate::transport::OfferConnectResult {
+                                conn,
+                                session_key,
+                                mode: "relay".to_string(),
+                                peer: Some(relay.to_string()),
+                                resume_used: Some(resume_used),
+                            }));
+                        }
+                        Ok(Err(e)) => warn!("Relay handshake failed via {}: {}", relay, e),
+                        Err(_) => warn!("Relay handshake timeout via {}", relay),
+                    }
                 }
                 Ok(Err(e)) => {
                     warn!("Relay {} failed: {}", relay, e);
@@ -482,7 +372,10 @@ impl IceAgent {
         Ok(None)
     }
 
-    async fn attempt_tor(&self) -> Result<Option<(Connection, SocketAddr)>> {
+    async fn attempt_tor_handshake(
+        &self,
+        resume: Option<&ResumeParams>,
+    ) -> Result<Option<crate::transport::OfferConnectResult>> {
         if let Some(onion) = self.offer.tor_onion_addr()? {
             match wan_tor::try_tor_connect(&self.config.tor_socks_addr, &onion, None, None).await {
                 Ok(stream) => {
@@ -491,7 +384,40 @@ impl IceAgent {
                         reader: Arc::new(Mutex::new(reader)),
                         writer: Arc::new(Mutex::new(writer)),
                     };
-                    return Ok(Some((conn, SocketAddr::from(([0, 0, 0, 0], 0)))));
+
+                    let tag8 = self.params.tag8;
+                    let key_enc = self.offer.rendezvous.key_enc;
+                    let tag16 = self.offer.rendezvous.tag16;
+                    let noise_role = self.noise_role;
+
+                    let handshake = async {
+                        if let Some(resume) = resume {
+                            crate::session_noise::run_resume_or_noise(
+                                noise_role, &conn, &key_enc, tag16, tag8, resume,
+                            )
+                            .await
+                        } else {
+                            let sk = crate::session_noise::run_noise_upgrade(
+                                noise_role, &conn, &key_enc, tag16, tag8,
+                            )
+                            .await?;
+                            Ok((sk, false))
+                        }
+                    };
+
+                    match tokio::time::timeout(Duration::from_secs(12), handshake).await {
+                        Ok(Ok((session_key, resume_used))) => {
+                            return Ok(Some(crate::transport::OfferConnectResult {
+                                conn,
+                                session_key,
+                                mode: "wan_tor".to_string(),
+                                peer: Some(onion),
+                                resume_used: Some(resume_used),
+                            }));
+                        }
+                        Ok(Err(e)) => warn!("Tor handshake failed: {}", e),
+                        Err(_) => warn!("Tor handshake timeout"),
+                    }
                 }
                 Err(e) => {
                     warn!("Tor connection attempt failed: {}", e);
@@ -532,23 +458,18 @@ impl IceAgent {
             );
         }
     }
-
-    fn get_local_ip_addresses(&self) -> Result<Vec<IpAddr>> {
-        crate::transport::lan::get_local_ip_addresses()
-    }
 }
 
-impl Clone for IceAgent {
-    fn clone(&self) -> Self {
-        Self {
-            params: self.params.clone(),
-            config: self.config.clone(),
-            noise_role: self.noise_role,
-            offer: self.offer.clone(),
-            offer_hash: self.offer_hash,
-            attempted: Arc::new(Mutex::new(std::collections::HashMap::new())),
-        }
+async fn bind_udp_dispatch(slot: &mut Option<Arc<UdpSocket>>, port: u16) -> Result<Arc<UdpSocket>> {
+    if let Some(sock) = slot.as_ref() {
+        return Ok(sock.clone());
     }
+    let sock = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], port)))
+        .await
+        .context("bind UDP socket for ICE")?;
+    let sock = Arc::new(sock);
+    *slot = Some(sock.clone());
+    Ok(sock)
 }
 
 pub async fn multipath_race_connect(
@@ -558,57 +479,27 @@ pub async fn multipath_race_connect(
     config: Config,
     noise_role: NoiseRole,
 ) -> Result<(Connection, SocketAddr)> {
+    let res =
+        multipath_race_connect_with_resume(offer, offer_hash, params, config, noise_role, None)
+            .await?;
+
+    let peer_addr = res
+        .conn
+        .peer_addr()
+        .or_else(|| res.peer.as_ref().and_then(|s| s.parse().ok()))
+        .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
+
+    Ok((res.conn, peer_addr))
+}
+
+pub async fn multipath_race_connect_with_resume(
+    offer: &OfferPayload,
+    offer_hash: [u8; 32],
+    params: RendezvousParams,
+    config: Config,
+    noise_role: NoiseRole,
+    resume: Option<ResumeParams>,
+) -> Result<crate::transport::OfferConnectResult> {
     let agent = IceAgent::new(params, config, noise_role, offer.clone(), offer_hash);
-    agent.race_candidates().await
-}
-
-pub async fn establish_connection_from_candidate(
-    _offer: &OfferPayload,
-    _cfg: &Config,
-    _noise_role: NoiseRole,
-    dispatch: Arc<UdpSocket>,
-    endpoint: Endpoint,
-) -> Result<OfferConnectResult> {
-    let session_key = [0u8; 32];
-
-    let conn = match endpoint.kind {
-        EndpointKind::Lan => {
-            let addr = endpoint
-                .addr
-                .ok_or_else(|| anyhow::anyhow!("LAN endpoint missing addr"))?;
-            Connection::Lan(dispatch, addr)
-        }
-        EndpointKind::Wan => {
-            let addr = endpoint
-                .addr
-                .ok_or_else(|| anyhow::anyhow!("WAN endpoint missing addr"))?;
-            Connection::Wan(dispatch, addr)
-        }
-        EndpointKind::Tor => {
-            return Err(anyhow::anyhow!("Tor not supported in UDP candidate mode"));
-        }
-    };
-
-    let mode = match endpoint.kind {
-        EndpointKind::Lan => "lan",
-        EndpointKind::Wan => "wan",
-        EndpointKind::Tor => "wan_tor",
-    }
-    .to_string();
-
-    Ok(OfferConnectResult {
-        conn,
-        session_key,
-        mode,
-        peer: endpoint.addr.map(|a| a.to_string()),
-        resume_used: None,
-    })
-}
-
-pub struct OfferConnectResult {
-    pub conn: Connection,
-    pub session_key: [u8; 32],
-    pub mode: String,
-    pub peer: Option<String>,
-    pub resume_used: Option<bool>,
+    agent.connect_first_validated(resume.as_ref()).await
 }

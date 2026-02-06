@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose, Engine as _};
 use clap::{Parser, Subcommand};
 use rand::RngCore;
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -14,6 +15,12 @@ struct Args {
     command: Commands,
     #[arg(long, default_value = DEFAULT_API)]
     api: String,
+    /// API bearer token (overrides env HANDSHACKE_API_TOKEN and HANDSHACKE_API_TOKEN_FILE)
+    #[arg(long)]
+    token: Option<String>,
+    /// Read API bearer token from file (overrides env HANDSHACKE_API_TOKEN_FILE)
+    #[arg(long)]
+    token_file: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -64,7 +71,14 @@ struct ConnectResponse {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let client = Client::new();
+    let token = resolve_api_token(&args)?;
+    let mut headers = HeaderMap::new();
+    if let Some(token) = &token {
+        let v = HeaderValue::from_str(&format!("Bearer {}", token))
+            .map_err(|_| anyhow!("Invalid token for Authorization header"))?;
+        headers.insert(AUTHORIZATION, v);
+    }
+    let client = Client::builder().default_headers(headers).build()?;
 
     match args.command {
         Commands::Host {
@@ -128,4 +142,36 @@ fn random_passphrase() -> String {
     let mut buf = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut buf);
     general_purpose::URL_SAFE_NO_PAD.encode(buf)
+}
+
+fn resolve_api_token(args: &Args) -> Result<Option<String>> {
+    if let Some(t) = args.token.as_ref() {
+        let t = t.trim();
+        if !t.is_empty() {
+            return Ok(Some(t.to_string()));
+        }
+    }
+
+    if let Some(path) = args
+        .token_file
+        .as_ref()
+        .cloned()
+        .or_else(|| std::env::var("HANDSHACKE_API_TOKEN_FILE").ok())
+    {
+        if let Ok(s) = std::fs::read_to_string(path) {
+            let t = s.trim();
+            if !t.is_empty() {
+                return Ok(Some(t.to_string()));
+            }
+        }
+    }
+
+    if let Ok(t) = std::env::var("HANDSHACKE_API_TOKEN") {
+        let t = t.trim().to_string();
+        if !t.is_empty() {
+            return Ok(Some(t));
+        }
+    }
+
+    Ok(None)
 }

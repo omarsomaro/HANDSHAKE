@@ -257,7 +257,6 @@ pub async fn spawn_receiver_task_with_stop(
             let guard = cipher_state.read().await;
             (guard.tag16(), guard.tag8())
         };
-        let mut ack_nonce_seq: Option<NonceSeq> = None;
         let sock = match connection.get_socket() {
             Some(s) => s,
             None => return,
@@ -308,8 +307,8 @@ pub async fn spawn_receiver_task_with_stop(
                                                         let mut guard = cipher_state.write().await;
                                                         guard.rotate_to(new_key);
                                                     }
-                                                    // Re-init ack nonce seq for new key
-                                                    ack_nonce_seq = Some(match NonceSeq::new(
+                                                    // Send ack best-effort using the new key.
+                                                    let mut ack_nonce_seq = match NonceSeq::new(
                                                         &new_key,
                                                         NONCE_DOMAIN_APP,
                                                         0x03,
@@ -322,35 +321,32 @@ pub async fn spawn_receiver_task_with_stop(
                                                             );
                                                             continue;
                                                         }
-                                                    });
-                                                    // Send ack best-effort
+                                                    };
                                                     let ctrl = Control::SessionKeyAck(key_id);
                                                     if let Ok(payload_bytes) = bincode::serialize(&ctrl) {
-                                                        if let Some(ns) = ack_nonce_seq.as_mut() {
-                                                            if let Ok((nonce, seq)) =
-                                                                ns.next_nonce_and_seq()
-                                                            {
-                                                                let clear = ClearPayload {
-                                                                    ts_ms: now_ms(),
-                                                                    seq,
-                                                                    data: payload_bytes,
-                                                                };
-                                                                let pkt = {
-                                                                    let guard = cipher_state.read().await;
-                                                                    seal_with_nonce(
-                                                                        guard.current_key(),
-                                                                        tag16,
-                                                                        tag8,
-                                                                        &clear,
-                                                                        &nonce,
-                                                                    )
-                                                                };
-                                                                if let Ok(pkt) = pkt {
-                                                                    if let Ok(raw) =
-                                                                        serialize_cipher_packet(&pkt)
-                                                                    {
-                                                                        let _ = sock.send_to(&raw, source).await;
-                                                                    }
+                                                        if let Ok((nonce, seq)) =
+                                                            ack_nonce_seq.next_nonce_and_seq()
+                                                        {
+                                                            let clear = ClearPayload {
+                                                                ts_ms: now_ms(),
+                                                                seq,
+                                                                data: payload_bytes,
+                                                            };
+                                                            let pkt = {
+                                                                let guard = cipher_state.read().await;
+                                                                seal_with_nonce(
+                                                                    guard.current_key(),
+                                                                    tag16,
+                                                                    tag8,
+                                                                    &clear,
+                                                                    &nonce,
+                                                                )
+                                                            };
+                                                            if let Ok(pkt) = pkt {
+                                                                if let Ok(raw) =
+                                                                    serialize_cipher_packet(&pkt)
+                                                                {
+                                                                    let _ = sock.send_to(&raw, source).await;
                                                                 }
                                                             }
                                                         }
@@ -408,7 +404,6 @@ pub async fn spawn_receiver_task_with_stop_io(
             let guard = cipher_state.read().await;
             (guard.tag16(), guard.tag8())
         };
-        let mut ack_nonce_seq: Option<NonceSeq> = None;
         let mut rw = crate::crypto::replay::ReplayWindow::new();
         let relay_addr = io.rate_limit_addr();
         let limit = io.max_packet_limit();
@@ -453,7 +448,7 @@ pub async fn spawn_receiver_task_with_stop_io(
                                                         let mut guard = cipher_state.write().await;
                                                         guard.rotate_to(new_key);
                                                     }
-                                                    ack_nonce_seq = Some(match NonceSeq::new(
+                                                    let mut ack_nonce_seq = match NonceSeq::new(
                                                         &new_key,
                                                         NONCE_DOMAIN_APP,
                                                         0x03,
@@ -466,34 +461,32 @@ pub async fn spawn_receiver_task_with_stop_io(
                                                             );
                                                             continue;
                                                         }
-                                                    });
+                                                    };
                                                     let ctrl = Control::SessionKeyAck(key_id);
                                                     if let Ok(payload_bytes) = bincode::serialize(&ctrl) {
-                                                        if let Some(ns) = ack_nonce_seq.as_mut() {
-                                                            if let Ok((nonce, seq)) =
-                                                                ns.next_nonce_and_seq()
-                                                            {
-                                                                let clear = ClearPayload {
-                                                                    ts_ms: now_ms(),
-                                                                    seq,
-                                                                    data: payload_bytes,
-                                                                };
-                                                                let pkt = {
-                                                                    let guard = cipher_state.read().await;
-                                                                    seal_with_nonce(
-                                                                        guard.current_key(),
-                                                                        tag16,
-                                                                        tag8,
-                                                                        &clear,
-                                                                        &nonce,
-                                                                    )
-                                                                };
-                                                                if let Ok(pkt) = pkt {
-                                                                    if let Ok(raw) =
-                                                                        serialize_cipher_packet(&pkt)
-                                                                    {
-                                                                        let _ = io.send(raw).await;
-                                                                    }
+                                                        if let Ok((nonce, seq)) =
+                                                            ack_nonce_seq.next_nonce_and_seq()
+                                                        {
+                                                            let clear = ClearPayload {
+                                                                ts_ms: now_ms(),
+                                                                seq,
+                                                                data: payload_bytes,
+                                                            };
+                                                            let pkt = {
+                                                                let guard = cipher_state.read().await;
+                                                                seal_with_nonce(
+                                                                    guard.current_key(),
+                                                                    tag16,
+                                                                    tag8,
+                                                                    &clear,
+                                                                    &nonce,
+                                                                )
+                                                            };
+                                                            if let Ok(pkt) = pkt {
+                                                                if let Ok(raw) =
+                                                                    serialize_cipher_packet(&pkt)
+                                                                {
+                                                                    let _ = io.send(raw).await;
                                                                 }
                                                             }
                                                         }

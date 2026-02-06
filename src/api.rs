@@ -1,6 +1,6 @@
-use axum::http::header::AUTHORIZATION;
+use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::StatusCode;
-use axum::http::{Request, StatusCode as AxumStatusCode};
+use axum::http::{HeaderValue, Method, Request, StatusCode as AxumStatusCode};
 use axum::{
     extract::{ConnectInfo, Extension, State},
     middleware::{from_fn_with_state, Next},
@@ -23,7 +23,7 @@ use tokio::{
 };
 use tower::ServiceBuilder;
 use tower_http::{
-    cors::{Any, CorsLayer},
+    cors::{AllowOrigin, CorsLayer},
     trace::TraceLayer,
 };
 
@@ -210,6 +210,35 @@ fn connect_err(code: StatusCode, msg: &str) -> ApiError {
         code: code.as_u16(),
         message: msg.to_string(),
     }
+}
+
+fn build_cors_layer() -> CorsLayer {
+    // CORS is primarily relevant for the GUI (dev server origin) and protects against drive-by
+    // browser access to localhost APIs. We keep an allowlist by default.
+    //
+    // Override with HANDSHACKE_API_CORS_ORIGINS="origin1,origin2".
+    let default_origins = "http://localhost:5173,http://127.0.0.1:5173,tauri://localhost";
+    let raw =
+        std::env::var("HANDSHACKE_API_CORS_ORIGINS").unwrap_or_else(|_| default_origins.into());
+
+    let origins: Vec<HeaderValue> = raw
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| HeaderValue::from_str(s).ok())
+        .collect();
+
+    let allow_origin = if origins.is_empty() {
+        // Safe fallback: disable cross-origin access.
+        AllowOrigin::predicate(|_, _| false)
+    } else {
+        AllowOrigin::list(origins)
+    };
+
+    CorsLayer::new()
+        .allow_origin(allow_origin)
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([AUTHORIZATION, CONTENT_TYPE])
 }
 
 pub async fn create_api_server(
@@ -400,13 +429,10 @@ pub async fn create_api_server(
     if let Some(token) = api_token {
         let token = std::sync::Arc::new(token);
         app = app.layer(from_fn_with_state(token, require_bearer));
-    } else {
-        let cors = CorsLayer::new()
-            .allow_methods(Any)
-            .allow_headers(Any)
-            .allow_origin(Any);
-        app = app.layer(cors);
     }
+
+    // IMPORTANT: CORS must be OUTERMOST so preflight OPTIONS does not get blocked by auth.
+    app = app.layer(build_cors_layer());
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!("API server listening on http://{}", bind);

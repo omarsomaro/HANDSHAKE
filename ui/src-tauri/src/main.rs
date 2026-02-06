@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -13,7 +13,7 @@ struct DaemonState(Mutex<DaemonHandle>);
 struct DaemonHandle {
   child: Option<CommandChild>,
   pid: Option<u32>,
-  token_file: Option<PathBuf>,
+  token: Option<String>,
   last_error: Option<String>,
   last_exit_code: Option<i32>,
   log_tail: VecDeque<String>,
@@ -23,8 +23,7 @@ struct DaemonHandle {
 struct StartResult {
   pid: u32,
   api_url: String,
-  token_file_path: String,
-  token_required: bool,
+  token: String,
 }
 
 #[derive(serde::Serialize)]
@@ -58,7 +57,8 @@ async fn start_daemon(
     return Err("unsafe_expose_api required for 0.0.0.0".into());
   }
 
-  let needs_token = unsafe_expose_api || !is_localhost_bind(&api_bind);
+  // Always require auth for the daemon API so it cannot be abused as a localhost decrypt oracle.
+  let needs_token = true;
 
   let mut guard = state.0.lock().unwrap();
   if guard.child.is_some() {
@@ -69,17 +69,13 @@ async fn start_daemon(
   guard.last_exit_code = None;
   guard.log_tail.clear();
 
-  let app_dir = app
-    .path()
-    .app_data_dir()
-    .map_err(|e| format!("app_data_dir error: {e}"))?
-    .join("handshacke");
-  std::fs::create_dir_all(&app_dir).map_err(|e| format!("mkdir error: {e}"))?;
-
-  let token_file = app_dir.join("api.token");
-  if needs_token && token_file.exists() {
-    let _ = std::fs::remove_file(&token_file);
-  }
+  // Keep token in RAM only. Pass it to the daemon via env so the UI can authenticate.
+  let token = if needs_token {
+    let token = random_hex_token(32);
+    Some(token)
+  } else {
+    None
+  };
 
   let mut cmd = app
     .shell()
@@ -118,11 +114,8 @@ async fn start_daemon(
     cmd = cmd.env("HANDSHACKE_TOR_ONION", onion);
   }
 
-  if needs_token {
-    cmd = cmd.env(
-      "HANDSHACKE_API_TOKEN_FILE",
-      token_file.to_string_lossy().to_string(),
-    );
+  if let Some(ref t) = token {
+    cmd = cmd.env("HANDSHACKE_API_TOKEN", t);
   }
 
   if unsafe_expose_api {
@@ -135,7 +128,7 @@ async fn start_daemon(
 
   guard.child = Some(child);
   guard.pid = Some(pid);
-  guard.token_file = if needs_token { Some(token_file.clone()) } else { None };
+  guard.token = token.clone();
 
   let app_handle = app.clone();
   tauri::async_runtime::spawn(async move {
@@ -179,27 +172,10 @@ async fn start_daemon(
     }
   });
 
-  if needs_token {
-    if let Err(err) = wait_for_token_file(&token_file, Duration::from_secs(5)) {
-      guard.last_error = Some(format!("token file not ready: {err}"));
-      if let Some(child) = guard.child.take() {
-        let _ = child.kill();
-      }
-      guard.pid = None;
-      guard.token_file = None;
-      return Err(format!("token file not ready: {err}"));
-    }
-  }
-
   Ok(StartResult {
     pid,
     api_url: format!("http://{api_bind}"),
-    token_file_path: if needs_token {
-      token_file.to_string_lossy().to_string()
-    } else {
-      String::new()
-    },
-    token_required: needs_token,
+    token: token.unwrap_or_default(),
   })
 }
 
@@ -209,9 +185,7 @@ async fn stop_daemon(state: State<'_, DaemonState>) -> Result<(), String> {
   if let Some(child) = guard.child.take() {
     let _ = child.kill();
   }
-  if let Some(path) = guard.token_file.take() {
-    let _ = std::fs::remove_file(path);
-  }
+  guard.token = None;
   guard.pid = None;
   Ok(())
 }
@@ -233,34 +207,10 @@ async fn daemon_logs(state: State<'_, DaemonState>) -> Result<Vec<String>, Strin
   Ok(guard.log_tail.iter().cloned().collect())
 }
 
-fn wait_for_token_file(path: &PathBuf, timeout: Duration) -> Result<(), String> {
-  let start = std::time::Instant::now();
-  while start.elapsed() < timeout {
-    if let Ok(meta) = std::fs::metadata(path) {
-      if meta.len() > 0 {
-        #[cfg(windows)]
-        {
-          println!("Token file written (Windows: ensure directory ACLs are restricted)");
-        }
-        return Ok(());
-      }
-    }
-    std::thread::sleep(Duration::from_millis(200));
-  }
-  Err("token file not ready".into())
-}
-
-fn is_localhost_bind(bind: &str) -> bool {
-  if bind.starts_with("127.0.0.1") || bind.starts_with("localhost") {
-    return true;
-  }
-  if bind.starts_with("[::1]") || bind.starts_with("::1") {
-    return true;
-  }
-  if let Ok(addr) = bind.parse::<std::net::SocketAddr>() {
-    return addr.ip().is_loopback();
-  }
-  false
+fn random_hex_token(nbytes: usize) -> String {
+  let mut buf = vec![0u8; nbytes];
+  getrandom::getrandom(&mut buf).expect("getrandom failed");
+  buf.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 fn main() {

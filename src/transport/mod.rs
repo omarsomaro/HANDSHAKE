@@ -524,64 +524,14 @@ pub async fn establish_connection_from_offer_with_resume(
         }
     }
 
-    let (conn, _peer_addr) = crate::transport::ice::multipath_race_connect(
+    // ICE module now validates the candidate by completing the resume/noise handshake.
+    crate::transport::ice::multipath_race_connect_with_resume(
         offer,
         offer_hash,
         params,
         cfg.clone(),
         noise_role,
+        resume,
     )
-    .await?;
-
-    let mode = match &conn {
-        Connection::Lan(_, _) => "lan",
-        Connection::Wan(_, _) => "wan",
-        Connection::WanTorStream { .. } => "wan_tor",
-        Connection::WanTcpStream { .. } => "wan_tcp",
-        Connection::Quic(_) => "quic",
-        Connection::WebRtc(_) => "webrtc",
-    }
-    .to_string();
-
-    let peer = match &conn {
-        Connection::Lan(_, addr) | Connection::Wan(_, addr) => Some(addr.to_string()),
-        Connection::WanTorStream { .. } => offer.tor_onion_addr()?,
-        Connection::WanTcpStream { peer, .. } => Some(peer.to_string()),
-        Connection::Quic(_) => conn.peer_addr().map(|addr| addr.to_string()),
-        Connection::WebRtc(_) => None,
-    };
-
-    let tag8 = crate::derive::derive_tag8_from_key(&offer.rendezvous.key_enc)?;
-    let (session_key, resume_used) = match resume {
-        Some(ref resume) => {
-            crate::session_noise::run_resume_or_noise(
-                noise_role,
-                &conn,
-                &offer.rendezvous.key_enc,
-                offer.rendezvous.tag16,
-                tag8,
-                resume,
-            )
-            .await?
-        }
-        None => (
-            crate::session_noise::run_noise_upgrade(
-                noise_role,
-                &conn,
-                &offer.rendezvous.key_enc,
-                offer.rendezvous.tag16,
-                tag8,
-            )
-            .await?,
-            false,
-        ),
-    };
-
-    Ok(OfferConnectResult {
-        conn,
-        session_key,
-        mode,
-        peer,
-        resume_used: resume.map(|_| resume_used),
-    })
+    .await
 }

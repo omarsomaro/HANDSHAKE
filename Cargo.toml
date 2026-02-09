@@ -4,7 +4,11 @@ version = "0.1.0"
 edition = "2021"
 description = "Deterministic P2P communication without servers"
 license = "MIT"
-authors = ["Bossman"]
+authors = ["Omar Prampolini"]
+readme = "README.md"
+repository = "https://github.com/omarsomaro/HANDSHAKE"
+keywords = ["p2p", "crypto", "privacy", "networking", "tor"]
+categories = ["network-programming", "cryptography", "command-line-utilities"]
 
 [dependencies]
 subtle = "2.5"
